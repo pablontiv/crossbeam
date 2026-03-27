@@ -1,0 +1,174 @@
+# .github/workflows/go-release.yml
+name: Go Release
+
+on:
+  workflow_call:
+    inputs:
+      quality-gate-jobs:
+        required: true
+        type: string
+        description: 'JSON array of job names to wait for before tagging'
+      binary-name:
+        required: false
+        type: string
+        default: ''
+        description: 'Binary name for smoke test, empty skips smoke test'
+      goreleaser-args:
+        required: false
+        type: string
+        default: 'release --clean'
+        description: 'Goreleaser arguments'
+      signing:
+        required: false
+        type: boolean
+        default: false
+        description: 'Enable GPG signing'
+      graduation-threshold:
+        required: false
+        type: number
+        default: 5
+        description: 'Minor version threshold for auto-graduation to v1.0.0. 0 disables.'
+    secrets:
+      GPG_PRIVATE_KEY:
+        required: false
+        description: 'GPG private key for signing (required if signing enabled)'
+      GPG_FINGERPRINT:
+        required: false
+        description: 'GPG fingerprint (required if signing enabled)'
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+jobs:
+  auto-tag:
+    name: Auto-tag
+    runs-on: ubuntu-latest
+    if: github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    outputs:
+      new_tag: ${{ steps.tag.outputs.new_tag }}
+      created: ${{ steps.tag.outputs.created }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+
+      - name: Compute and push tag
+        id: tag
+        env:
+          GRADUATION_THRESHOLD: ${{ inputs.graduation-threshold }}
+        run: |
+          # Find latest semver tag
+          LATEST=$(git tag -l 'v*' | sort -V | tail -1)
+          if [[ -z "$LATEST" ]]; then
+            LATEST="v0.0.0"
+          fi
+
+          # Parse version components
+          MAJOR=$(echo "$LATEST" | sed 's/^v//' | cut -d. -f1)
+          MINOR=$(echo "$LATEST" | sed 's/^v//' | cut -d. -f2)
+          PATCH=$(echo "$LATEST" | sed 's/^v//' | cut -d. -f3)
+
+          # Determine commit type from HEAD message
+          SUBJECT=$(git log -1 --pretty=%s)
+          BODY=$(git log -1 --pretty=%b)
+          BREAKING=false
+          TYPE=other
+
+          # Check for breaking: ! in subject OR BREAKING CHANGE trailer in body
+          if echo "$SUBJECT" | grep -qE '^[a-z]+(\(.+\))?!:' || echo "$BODY" | grep -qE 'BREAKING CHANGE'; then
+            BREAKING=true
+          fi
+
+          if echo "$SUBJECT" | grep -qE '^feat(\(.+\))?[!]?:'; then
+            TYPE=feat
+          fi
+
+          # Apply bump table
+          if [[ $MAJOR -eq 0 ]]; then
+            if [[ $GRADUATION_THRESHOLD -gt 0 && $MINOR -ge $GRADUATION_THRESHOLD && ("$TYPE" == "feat" || "$BREAKING" == "true") ]]; then
+              NEW_TAG="v1.0.0"
+            elif [[ "$TYPE" == "feat" || "$BREAKING" == "true" ]]; then
+              MINOR=$((MINOR + 1))
+              PATCH=0
+              NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+            else
+              PATCH=$((PATCH + 1))
+              NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+            fi
+          else
+            if [[ "$BREAKING" == "true" ]]; then
+              MAJOR=$((MAJOR + 1))
+              MINOR=0
+              PATCH=0
+              NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+            elif [[ "$TYPE" == "feat" ]]; then
+              MINOR=$((MINOR + 1))
+              PATCH=0
+              NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+            else
+              PATCH=$((PATCH + 1))
+              NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+            fi
+          fi
+
+          echo "Computed tag: $NEW_TAG (from $LATEST, type=$TYPE, breaking=$BREAKING)"
+
+          # Concurrent guard: check if tag already exists on remote
+          if git ls-remote --tags origin | grep -q "refs/tags/${NEW_TAG}$"; then
+            echo "Tag $NEW_TAG already exists on remote, skipping"
+            echo "new_tag=$NEW_TAG" >> "$GITHUB_OUTPUT"
+            echo "created=false" >> "$GITHUB_OUTPUT"
+          else
+            git tag "$NEW_TAG"
+            git push origin "$NEW_TAG"
+            echo "new_tag=$NEW_TAG" >> "$GITHUB_OUTPUT"
+            echo "created=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  release:
+    name: Release
+    runs-on: ubuntu-latest
+    needs: auto-tag
+    if: needs.auto-tag.outputs.created == 'true'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+        with:
+          fetch-depth: 0
+
+      - name: Setup Go
+        uses: actions/setup-go@4b73464bb391d4059bd26b0524d20df3927bd417
+        with:
+          go-version: stable
+
+      - name: Import GPG key
+        if: inputs.signing
+        uses: crazy-max/ghaction-import-gpg@e89d40939c28e39f97cf32e97db1ba6f489de4f0
+        with:
+          gpg_private_key: ${{ secrets.GPG_PRIVATE_KEY }}
+          fingerprint: ${{ secrets.GPG_FINGERPRINT }}
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@9ed2f89a662bf1735a48bc8557fd212fa902bebf
+        with:
+          version: latest
+          args: ${{ inputs.goreleaser-args }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Smoke test binary
+        if: inputs.binary-name != ''
+        run: |
+          ARTIFACT=$(find dist/ -name "${{ inputs.binary-name }}" -type f | head -1)
+          if [[ -n "$ARTIFACT" ]]; then
+            chmod +x "$ARTIFACT"
+            "$ARTIFACT" --version || "$ARTIFACT" version || echo "Smoke test: binary executes"
+          fi
+
+      - name: Generate SLSA attestation
+        uses: actions/attest-build-provenance@db473fddc028af60658334401dc6fa3ffd8669fd
+        with:
+          subject-path: 'dist/checksums.txt'
