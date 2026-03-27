@@ -142,19 +142,22 @@ crossbeam/
 - `binary-name` (optional, string, default: `""`): Binary name for smoke test, empty skips smoke test
 - `goreleaser-args` (optional, string, default: `release --clean`): Goreleaser arguments
 - `signing` (optional, boolean, default: `false`): Enable GPG signing
+- `graduation-threshold` (optional, number, default: `5`): Minor version threshold for auto-graduation to v1.0.0. Set to 0 to disable.
 
 **Secrets:**
 - `GPG_PRIVATE_KEY` (optional): Required if signing enabled
 - `GPG_FINGERPRINT` (optional): Required if signing enabled
 
 **Jobs:**
-1. **auto-tag** — Conventional commit analysis, semver bump (pre-1.0: feat=patch, breaking=minor; post-1.0: feat=minor, breaking=major), tag push with concurrent guard
+1. **auto-tag** — Conventional commit analysis, semver bump per bump table (pre-1.0: feat/breaking=minor, others=patch; post-1.0: feat=minor, breaking=major, others=patch), auto-graduation check, tag push with concurrent guard
 2. **release** — goreleaser-action if tag was created, multi-platform builds, SLSA attestation
 
 **Permissions:** `contents: write`, `id-token: write`, `attestations: write`
 
 **Version strategy:**
-- Prefixes: `feat*` → minor/patch, `fix*`/`perf*` → patch, `*!` → breaking
+- Pre-1.0 (major == 0): `feat`, `feat!`, `*!` → minor; all others → patch
+- Post-1.0 (major >= 1): `feat` → minor; `*!` → major; all others → patch
+- Auto-graduation: if major == 0 and minor >= graduation-threshold, next feat/breaking creates v1.0.0
 - Initial tag: `v0.0.0` if no tags exist
 - Concurrent guard: `git ls-remote --tags origin` check before push
 
@@ -186,9 +189,10 @@ crossbeam/
 - `platforms` (optional, string, default: `linux`): Comma-separated: `linux`, `macos`, `windows`
 - `changelog-tool` (optional, string, default: `generate-notes`): `git-cliff` or `generate-notes`
 - `static-target` (optional, string, default: `x86_64-unknown-linux-musl`): Static build target
+- `graduation-threshold` (optional, number, default: `5`): Minor version threshold for auto-graduation to v1.0.0. Set to 0 to disable.
 
 **Jobs:**
-1. **auto-tag** — Same conventional commit strategy as go-release
+1. **auto-tag** — Same conventional commit strategy as go-release (bump table, auto-graduation, concurrent guard)
 2. **release** — Build native + static musl, smoke test, create GitHub release
 3. **release-macos** (conditional on platforms input) — aarch64 build, upload to release
 4. **release-windows** (conditional on platforms input) — x86_64 build, upload to release
@@ -435,11 +439,58 @@ Praxis/conform evolves from "template generator" to "drift detector against cros
 
 ## Versionado
 
-- Semver tags: `v1.0.0`, `v1.1.0`, `v2.0.0`
+Full versioning strategy documented in [versioning-strategy.md](2026-03-27-versioning-strategy.md).
+
+### Bump Logic (consuming repos)
+
+**Pre-1.0 (major == 0):**
+
+| Commit Prefix | Bump |
+|---|---|
+| `fix`, `perf`, `refactor`, `docs`, `ci`, `chore`, `style`, `test` | patch |
+| `feat`, `feat!`, any `*!` (breaking) | minor |
+
+**Post-1.0 (major >= 1):**
+
+| Commit Prefix | Bump |
+|---|---|
+| `fix`, `perf`, `refactor`, `docs`, `ci`, `chore`, `style`, `test` | patch |
+| `feat` | minor |
+| any `*!` (breaking) | major |
+
+### Auto-Graduation
+
+When `major == 0` and `minor >= graduation-threshold` (workflow input, default `5`), the next `feat` or breaking commit creates `v1.0.0`. Setting `graduation-threshold: 0` disables auto-graduation. Only feat/breaking commits trigger graduation — patches never do.
+
+### Crossbeam Versioning
+
+Crossbeam starts at `v1.0.0` (stable from day 1).
+
+- New reusable workflow or new optional input → minor bump
+- Action SHA update, bug fix, documentation → patch bump
+- Input rename/removal, job removal, breaking contract change → major bump
 - Major tag alias: `v1` points to latest `v1.x.x` (consumers reference `@v1`)
-- Breaking changes (input renames, removed jobs) require major bump
-- Action SHA updates, new optional inputs, bug fixes are minor/patch
 - Dependabot on crossbeam itself to keep action SHAs current
+
+### Version Migration Strategy
+
+Forward-only — no existing tags are modified or deleted. External users depend on current versions.
+
+| Repo | Current Version | Migration Action | First New Version |
+|------|----------------|-----------------|-------------------|
+| rootline | v0.9.121 | Manual `v1.0.0` tag at HEAD | v1.0.1 (fix) or v1.1.0 (feat) |
+| backscroll | v0.3.2 | No action, new logic from next commit | v0.3.3 (fix) or v0.4.0 (feat) |
+| kedral | v0.1.3 | No action, new logic from next commit | v0.1.4 (fix) or v0.2.0 (feat) |
+| localops | no tags | Starts at v0.0.0 | v0.0.1 (fix) or v0.1.0 (feat) |
+| homeserver | no tags | Starts at v0.0.0 | v0.0.1 (fix) or v0.1.0 (feat) |
+| dotfiles | no tags | Starts at v0.0.0 | v0.0.1 (fix) or v0.1.0 (feat) |
+
+### Retroactive Validation
+
+Applied the new logic against git history to validate the design:
+
+- **rootline:** 24 feat commits among 43 recent. Under new logic → v1.25.0 (graduated at commit #6). Actual: v0.9.121.
+- **backscroll:** 4 feat commits (1 `feat!`) among 14 recent. Under new logic with threshold=5 → v0.4.0 (not yet graduated). Actual: v0.3.2.
 
 ## Migration Plan
 
@@ -469,11 +520,18 @@ Praxis/conform evolves from "template generator" to "drift detector against cros
 
 ### Phase 4 — Release Workflows
 
-1. Implement `go-release.yml` (auto-tag + goreleaser)
-2. Implement `rust-release.yml` (auto-tag + cargo-zigbuild + optional multi-platform)
+1. Implement `go-release.yml` (auto-tag with new bump table + auto-graduation + goreleaser)
+2. Implement `rust-release.yml` (auto-tag with new bump table + auto-graduation + cargo-zigbuild + optional multi-platform)
 3. Tag `v1.3.0`
-4. Migrate release jobs from all repos
-5. End-to-end validation: push a feat commit, verify tag + release created
+4. Pre-migration version setup:
+   - rootline: Create `v1.0.0` tag manually at HEAD (forward-only, no re-tagging). Disable old release workflow first.
+   - backscroll, kedral: No manual action. Continue with current tags.
+   - localops, homeserver, dotfiles: No existing tags. First workflow run creates `v0.0.0` baseline.
+5. Migrate release jobs from all repos, passing `graduation-threshold` where non-default values are needed
+6. End-to-end validation per repo:
+   - rootline: push `feat` commit, verify minor bump (v1.0.0 → v1.1.0)
+   - backscroll: push `feat` commit, verify minor bump in pre-1.0 (v0.3.2 → v0.4.0)
+   - Verify no existing tags were modified
 
 ## Success Criteria
 
@@ -484,3 +542,7 @@ Praxis/conform evolves from "template generator" to "drift detector against cros
 - Praxis/conform audits against crossbeam artifacts instead of internal templates
 - CI behavior is identical before and after migration (no regressions)
 - Single PR to crossbeam propagates action SHA updates to all consumers
+- rootline version numbering reflects post-1.0 maturity (v1.x.x series)
+- `feat` commits produce minor bumps in pre-1.0 repos (not patch)
+- Auto-graduation fires correctly when minor threshold is reached
+- No existing tags are modified or deleted during migration
