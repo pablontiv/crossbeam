@@ -1,0 +1,77 @@
+name: Rust CI
+
+on:
+  workflow_call:
+    inputs:
+      rust-toolchain:
+        required: false
+        type: string
+        default: 'stable'
+        description: 'Rust toolchain'
+      deny-checks:
+        required: false
+        type: string
+        default: 'licenses bans advisories'
+        description: 'cargo-deny check arguments'
+      test-args:
+        required: false
+        type: string
+        default: '--all-features'
+        description: 'Additional cargo test arguments'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check-lint:
+    name: Check & Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
+        with:
+          toolchain: ${{ inputs.rust-toolchain }}
+          components: rustfmt, clippy
+
+      - name: Format check
+        run: cargo fmt --check
+
+      - name: Clippy
+        run: cargo clippy -- -D warnings
+
+      - name: Check
+        run: cargo check
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9
+        with:
+          toolchain: ${{ inputs.rust-toolchain }}
+
+      - name: Test
+        run: cargo test ${{ inputs.test-args }}
+
+  audit:
+    name: Audit
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Install cargo-deny
+        run: cargo install cargo-deny
+
+      - name: Run cargo-deny
+        run: cargo deny check ${{ inputs.deny-checks }}
