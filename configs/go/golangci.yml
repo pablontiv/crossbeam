@@ -1,0 +1,22 @@
+version: "2"
+run:
+  timeout: 3m
+linters:
+  default: none
+  enable:
+    - govet
+    - errcheck
+    - staticcheck
+    - unused
+    - ineffassign
+    - gocritic
+    - gosec
+linters-settings:
+  gosec:
+    excludes:
+      - G301    # directory permissions
+      - G304    # file inclusion via variable
+      - G306    # file write permissions
+issues:
+  max-issues-per-linter: 50
+  max-same-issues: 5
