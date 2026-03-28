@@ -1,0 +1,72 @@
+name: SOPS Guard
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  guard:
+    name: Plaintext guard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+
+      - name: Check for unencrypted files
+        run: |
+          FAILED=0
+          CHECKED=0
+
+          # Find all .sops.yaml files in the repo
+          while IFS= read -r sops_config; do
+            CONFIG_DIR=$(dirname "$sops_config")
+
+            # Extract path_regex patterns from creation_rules
+            PATTERNS=$(python3 -c "
+          import yaml, sys
+          with open('$sops_config') as f:
+              cfg = yaml.safe_load(f)
+          for rule in cfg.get('creation_rules', []):
+              pr = rule.get('path_regex', '')
+              if pr:
+                  print(pr)
+          ")
+
+            if [[ -z "$PATTERNS" ]]; then
+              echo "⚠ No path_regex patterns found in $sops_config"
+              continue
+            fi
+
+            # For each pattern, find matching files relative to the config directory
+            while IFS= read -r pattern; do
+              while IFS= read -r file; do
+                [[ -z "$file" ]] && continue
+                CHECKED=$((CHECKED + 1))
+
+                # Check if file contains SOPS metadata
+                if grep -qE '^sops:' "$file" 2>/dev/null || \
+                   grep -q '"sops"' "$file" 2>/dev/null || \
+                   grep -q 'ENC\[AES256' "$file" 2>/dev/null; then
+                  echo "  ✓ $file"
+                else
+                  echo "  ✗ $file — NOT ENCRYPTED"
+                  FAILED=$((FAILED + 1))
+                fi
+              done < <(find "$CONFIG_DIR" -type f | grep -E "$pattern" 2>/dev/null)
+            done <<< "$PATTERNS"
+          done < <(find . -name '.sops.yaml' -type f)
+
+          echo ""
+          echo "Checked $CHECKED files, $FAILED unencrypted"
+
+          if [[ $CHECKED -eq 0 ]]; then
+            echo "⚠ No .sops.yaml found or no matching files — nothing to check"
+            exit 0
+          fi
+
+          if [[ $FAILED -gt 0 ]]; then
+            echo "::error::Found $FAILED file(s) matching SOPS patterns but missing encryption metadata"
+            exit 1
+          fi
