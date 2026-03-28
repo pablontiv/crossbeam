@@ -1,0 +1,21 @@
+version: 2
+schema:
+    tipo:
+        type: enum
+        enum: [session-state]
+        required: true
+    proyecto:
+        type: string
+        required: true
+    branch:
+        type: string
+    fecha:
+        type: string
+        required: true
+    resumen:
+        type: string
+        required: true
+    estado:
+        type: enum
+        enum: [saved, restored, archived]
+        required: true

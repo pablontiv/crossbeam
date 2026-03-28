@@ -1,0 +1,35 @@
+# Go binaries
+/{{BINARY_NAME}}
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test binary
+*.test
+
+# Output of go coverage
+*.out
+
+# Go workspace
+go.work
+go.work.sum
+
+# Build
+bin/
+dist/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Claude Code skill workspaces
+*-workspace/
+
+# OS
+.DS_Store
+Thumbs.db

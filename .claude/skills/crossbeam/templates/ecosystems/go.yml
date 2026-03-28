@@ -1,0 +1,68 @@
+# Go ecosystem metadata for /conform templates
+ecosystem: gomod
+language: go
+marker_file: go.mod
+file_ext: "*.go"
+
+# Quality commands
+fmt_check: 'gofmt -l . | grep . && { echo "ERROR: Code not formatted. Run: just fmt"; exit 1; } || true'
+fmt_fix: "gofmt -l -w ."
+lint_cmd: "golangci-lint run"
+test_cmd: "go test ./... -race"
+vuln_cmd: "govulncheck ./..."
+build_cmd: "go build ./..."
+tidy_cmd: "go mod tidy"
+
+# Release
+build_release_cmd: 'go build -ldflags "-X main.version=$(git describe --tags 2>/dev/null || echo dev)" -o {{BINARY_NAME}} ./cmd/{{BINARY_NAME}}/'
+version_file: "cmd/{{BINARY_NAME}}/root.go"
+version_pattern: 'var version = ".*"'
+version_replace: 'var version = "{{VERSION}}"'
+
+# CI-specific
+setup_action: "actions/setup-go"
+setup_with: "go-version: stable"
+lint_action: "golangci/golangci-lint-action"
+vuln_install: "go install golang.org/x/vuln/cmd/govulncheck@latest"
+release_tool: goreleaser
+tidy_check: |
+  go mod tidy
+  if ! git diff --exit-code go.mod go.sum; then
+    echo "::error::go.mod or go.sum is not tidy."
+    exit 1
+  fi
+
+# Editor config
+indent_style: tab
+indent_size: 8
+
+# Pre-commit hook
+pre_commit_format: |
+  # Go formatting is handled by pre-commit framework (golangci-lint + gofmt)
+  # See .pre-commit-config.yaml
+pre_commit_lint: ""
+
+# Justfile
+check_recipe: |
+  gofmt -l . | grep . && { echo "ERROR: Code not formatted. Run: just fmt"; exit 1; } || true
+  golangci-lint run
+  go build ./...
+test_recipe: "go test ./... -race"
+fmt_recipe: "gofmt -l -w ."
+
+# Pre-push infra drift paths
+infra_paths: ".github/ .goreleaser.yml install.sh install.ps1 Justfile go.mod"
+
+# Linter config
+linter_config_file: ".golangci.yml"
+
+# Dependency policy (Go uses govulncheck, no separate config file)
+dependency_policy_file: ""
+dependency_policy_cmd: "govulncheck ./..."
+
+# Changelog (goreleaser handles changelog natively)
+changelog_tool: "goreleaser"
+changelog_config: ".goreleaser.yml"
+
+# Minimum version
+min_version: "Go 1.24+"
