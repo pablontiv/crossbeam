@@ -41,6 +41,13 @@ jobs:
           go-version: ${{ inputs.go-version }}
           go-version-file: ${{ inputs.go-version-file || '' }}
 
+      - name: Cache Go build
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        with:
+          path: ~/.cache/go-build
+          key: ${{ runner.os }}-gobuild-${{ hashFiles('**/*.go') }}
+          restore-keys: ${{ runner.os }}-gobuild-
+
       - name: Build
         run: go build ./...
 
@@ -56,6 +63,13 @@ jobs:
         with:
           go-version: ${{ inputs.go-version }}
           go-version-file: ${{ inputs.go-version-file || '' }}
+
+      - name: Cache Go build
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        with:
+          path: ~/.cache/go-build
+          key: ${{ runner.os }}-gobuild-${{ hashFiles('**/*.go') }}
+          restore-keys: ${{ runner.os }}-gobuild-
 
       - name: Test with coverage
         run: go test ./... -race -coverprofile=coverage.out
@@ -119,6 +133,13 @@ jobs:
         with:
           go-version: ${{ inputs.go-version }}
           go-version-file: ${{ inputs.go-version-file || '' }}
+
+      - name: Cache Go build
+        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
+        with:
+          path: ~/.cache/go-build
+          key: ${{ runner.os }}-gobuild-${{ hashFiles('**/*.go') }}
+          restore-keys: ${{ runner.os }}-gobuild-
 
       - name: Install govulncheck
         run: go install golang.org/x/vuln/cmd/govulncheck@latest
