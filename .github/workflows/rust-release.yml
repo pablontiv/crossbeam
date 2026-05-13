@@ -179,17 +179,19 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          GENERATE_NOTES_FLAG=""
+          RELEASE_ARGS=()
           if [[ "${{ inputs.changelog-tool }}" != "git-cliff" ]]; then
-            GENERATE_NOTES_FLAG="--generate-notes"
+            RELEASE_ARGS+=(--generate-notes)
+          fi
+          if [[ -s CHANGELOG.md ]]; then
+            RELEASE_ARGS+=(--notes-file CHANGELOG.md)
           fi
 
           gh release create "${{ needs.auto-tag.outputs.new_tag }}" \
             --title "${{ needs.auto-tag.outputs.new_tag }}" \
-            ${GENERATE_NOTES_FLAG} \
-            $([[ -s CHANGELOG.md ]] && echo "--notes-file CHANGELOG.md" || echo "") \
-            target/release/${{ inputs.binary-name }} \
-            target/${{ inputs.static-target }}/release/${{ inputs.binary-name }}
+            "${RELEASE_ARGS[@]}" \
+            "target/release/${{ inputs.binary-name }}" \
+            "target/${{ inputs.static-target }}/release/${{ inputs.binary-name }}"
 
       - name: Generate SLSA attestation
         uses: actions/attest-build-provenance@db473fddc028af60658334401dc6fa3ffd8669fd
