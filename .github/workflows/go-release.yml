@@ -169,6 +169,7 @@ jobs:
           fi
 
       - name: Generate SLSA attestation
+        continue-on-error: true
         uses: actions/attest-build-provenance@db473fddc028af60658334401dc6fa3ffd8669fd
         with:
           subject-path: 'dist/checksums.txt'
