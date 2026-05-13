@@ -30,7 +30,7 @@ jobs:
         run: actionlint
 
       - name: Run yamllint
-        run: yamllint .github/workflows/
+        run: yamllint -c .yamllint.yml .github/workflows/
 
   test:
     name: Test
