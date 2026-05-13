@@ -175,6 +175,11 @@ jobs:
             echo "" > CHANGELOG.md
           fi
 
+      - name: Rename binaries with platform suffix
+        run: |
+          cp "target/release/${{ inputs.binary-name }}" "${{ inputs.binary-name }}-linux-x86_64"
+          cp "target/${{ inputs.static-target }}/release/${{ inputs.binary-name }}" "${{ inputs.binary-name }}-linux-x86_64-musl"
+
       - name: Create GitHub release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -190,13 +195,13 @@ jobs:
           gh release create "${{ needs.auto-tag.outputs.new_tag }}" \
             --title "${{ needs.auto-tag.outputs.new_tag }}" \
             "${RELEASE_ARGS[@]}" \
-            "target/release/${{ inputs.binary-name }}" \
-            "target/${{ inputs.static-target }}/release/${{ inputs.binary-name }}"
+            "${{ inputs.binary-name }}-linux-x86_64" \
+            "${{ inputs.binary-name }}-linux-x86_64-musl"
 
       - name: Generate SLSA attestation
         uses: actions/attest-build-provenance@db473fddc028af60658334401dc6fa3ffd8669fd
         with:
-          subject-path: 'target/release/${{ inputs.binary-name }}'
+          subject-path: '${{ inputs.binary-name }}-linux-x86_64'
 
   release-macos:
     name: Release (macOS)
@@ -219,12 +224,15 @@ jobs:
       - name: Build
         run: cargo auditable build --release --target aarch64-apple-darwin
 
+      - name: Rename binary with platform suffix
+        run: cp "target/aarch64-apple-darwin/release/${{ inputs.binary-name }}" "${{ inputs.binary-name }}-macos-aarch64"
+
       - name: Upload to release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release upload "${{ needs.auto-tag.outputs.new_tag }}" \
-            target/aarch64-apple-darwin/release/${{ inputs.binary-name }}
+            "${{ inputs.binary-name }}-macos-aarch64"
 
   release-windows:
     name: Release (Windows)
@@ -246,9 +254,12 @@ jobs:
       - name: Build
         run: cargo auditable build --release
 
+      - name: Rename binary with platform suffix
+        run: Copy-Item "target/release/${{ inputs.binary-name }}.exe" "${{ inputs.binary-name }}-windows-x86_64.exe"
+
       - name: Upload to release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           gh release upload "${{ needs.auto-tag.outputs.new_tag }}" `
-            target/release/${{ inputs.binary-name }}.exe
+            "${{ inputs.binary-name }}-windows-x86_64.exe"
