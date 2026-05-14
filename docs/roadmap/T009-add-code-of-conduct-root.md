@@ -1,5 +1,5 @@
 ---
-estado: Pending
+estado: Completed
 tipo: task
 ---
 # T009: Add CODE_OF_CONDUCT.md to repo root

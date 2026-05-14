@@ -1,5 +1,5 @@
 ---
-estado: Pending
+estado: Completed
 tipo: task
 ---
 # T007: Add LICENSE file (PolyForm Noncommercial 1.0.0)
