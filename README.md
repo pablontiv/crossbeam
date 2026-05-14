@@ -14,19 +14,55 @@ Shared CI/CD infrastructure for the [pablontiv](https://github.com/pablontiv) ec
 | Baseline tool configs | `configs/` (golangci, goreleaser, rustfmt, clippy, deny, editorconfig) |
 | Community file templates | `templates/` (CONTRIBUTING, SECURITY, issue templates) |
 
-> **Status**: v1 stable — all workflows in active use across the ecosystem. Consumers reference `@v1`.
-
 ---
 
 ## Table of Contents
 
+- [Quick Start](#quick-start)
 - [Core Idea](#core-idea)
 - [What's Inside](#whats-inside)
 - [Usage](#usage)
 - [AI-Native](#ai-native)
 - [Versioning](#versioning)
+- [Documentation](#documentation)
 - [Development](#development)
 - [License](#license)
+
+---
+
+## Quick Start
+
+```yaml
+# 1. Wire up Go CI — build, test, lint, coverage gate
+ci:
+  uses: pablontiv/crossbeam/.github/workflows/go-ci.yml@v1
+  with:
+    coverage-threshold: 85
+
+# 2. Add secret scanning (runs on every push)
+gitleaks:
+  uses: pablontiv/crossbeam/.github/workflows/gitleaks.yml@v1
+
+# 3. Add security analysis (nightly CodeQL)
+codeql:
+  uses: pablontiv/crossbeam/.github/workflows/codeql.yml@v1
+  with:
+    language: go
+
+# 4. Add automated releases — auto-tag + goreleaser on push to main
+release:
+  uses: pablontiv/crossbeam/.github/workflows/go-release.yml@v1
+  needs: [ci, gitleaks]
+  with:
+    quality-gate-jobs: '["ci","gitleaks"]'
+    binary-name: my-tool
+  permissions:
+    contents: write
+    id-token: write
+    attestations: write
+```
+
+See [Usage](#usage) for the full `.github/workflows/ci.yml` stub.
 
 ---
 
@@ -131,6 +167,20 @@ Release workflows (`go-release.yml`, `rust-release.yml`) implement automatic ver
 **Pre-1.0:** `feat` → minor, `fix` → patch, breaking → minor
 **Post-1.0:** `feat` → minor, `fix` → patch, breaking → major
 **Auto-graduation:** When minor version reaches the configurable threshold (default 5), the next feature commit creates `v1.0.0`.
+
+---
+
+## Documentation
+
+| Topic | Description |
+|-------|-------------|
+| [go-ci.yml](.github/workflows/go-ci.yml) | Go CI: inputs, coverage threshold, lint gate |
+| [go-release.yml](.github/workflows/go-release.yml) | Auto-tag + goreleaser: quality gates, graduation threshold |
+| [codeql.yml](.github/workflows/codeql.yml) | CodeQL: language input, nightly schedule |
+| [scorecard.yml](.github/workflows/scorecard.yml) | OpenSSF Scorecard: SARIF upload |
+| [gitleaks.yml](.github/workflows/gitleaks.yml) | Secret scanning |
+| [configs/go/](configs/go/) | golangci-lint and goreleaser baseline configs |
+| [templates/](templates/) | Community file templates for consuming repos |
 
 ---
 
