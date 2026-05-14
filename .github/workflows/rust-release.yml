@@ -199,7 +199,7 @@ jobs:
             "${{ inputs.binary-name }}-linux-x86_64-musl"
 
       - name: Generate SLSA attestation
-        uses: actions/attest-build-provenance@db473fddc028af60658334401dc6fa3ffd8669fd
+        uses: actions/attest-build-provenance@a2bbfa25375fe432b6a289bc6b6cd05ecd0c4c32
         with:
           subject-path: '${{ inputs.binary-name }}-linux-x86_64'
 
