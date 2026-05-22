@@ -15,7 +15,6 @@ Shared CI/CD infrastructure for the pablontiv ecosystem. Contains reusable GitHu
 | Workflow | Purpose | Key Inputs |
 |----------|---------|------------|
 | codeql.yml | CodeQL security scanning | `language` (go/rust/actions) |
-| scorecard.yml | OpenSSF Scorecard | none |
 | gitleaks.yml | Secret scanning | none |
 | go-ci.yml | Go CI (build, test, tidy, lint, vuln) | `go-version`, `coverage-threshold` (default: 0), `lint-version` |
 | rust-ci.yml | Rust CI (check-lint, test, audit) | `rust-toolchain`, `deny-checks`, `test-args` |
