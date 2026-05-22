@@ -1,0 +1,5 @@
+# actionlint configuration
+# Align line-length rules with yamllint (max 160 characters)
+rules:
+  line-length:
+    max: 160
