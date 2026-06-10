@@ -49,18 +49,24 @@ jobs:
           MINOR=$(echo "$LATEST" | sed 's/^v//' | cut -d. -f2)
           PATCH=$(echo "$LATEST" | sed 's/^v//' | cut -d. -f3)
 
-          # Determine commit type from HEAD message
-          SUBJECT=$(git log -1 --pretty=%s)
-          BODY=$(git log -1 --pretty=%b)
+          # Classify every commit since the last tag (a push may contain several
+          # commits); the highest-impact type wins: breaking > feat > other.
+          if [[ "$LATEST" == "v0.0.0" ]]; then
+            RANGE="HEAD"
+          else
+            RANGE="${LATEST}..HEAD"
+          fi
+          SUBJECTS=$(git log --pretty=%s "$RANGE")
+          BODIES=$(git log --pretty=%b "$RANGE")
           BREAKING=false
           TYPE=other
 
           # Check for breaking: ! in subject OR BREAKING CHANGE trailer in body
-          if echo "$SUBJECT" | grep -qE '^[a-z]+(\(.+\))?!:' || echo "$BODY" | grep -qE 'BREAKING CHANGE'; then
+          if echo "$SUBJECTS" | grep -qE '^[a-z]+(\(.+\))?!:' || echo "$BODIES" | grep -qE 'BREAKING CHANGE'; then
             BREAKING=true
           fi
 
-          if echo "$SUBJECT" | grep -qE '^feat(\(.+\))?[!]?:'; then
+          if echo "$SUBJECTS" | grep -qE '^feat(\(.+\))?[!]?:'; then
             TYPE=feat
           fi
 

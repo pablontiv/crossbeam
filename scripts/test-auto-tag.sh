@@ -34,19 +34,26 @@ compute_tag() {
   MINOR=$(echo "$LATEST" | sed 's/^v//' | cut -d. -f2)
   PATCH=$(echo "$LATEST" | sed 's/^v//' | cut -d. -f3)
 
-  local SUBJECT BODY TYPE BREAKING
-  SUBJECT=$(git log -1 --pretty=%s)
-  BODY=$(git log -1 --pretty=%b)
+  local RANGE SUBJECTS BODIES TYPE BREAKING
+  # Classify every commit since the last tag (a push may contain several
+  # commits); the highest-impact type wins: breaking > feat > other.
+  if [[ "$LATEST" == "v0.0.0" ]]; then
+    RANGE="HEAD"
+  else
+    RANGE="${LATEST}..HEAD"
+  fi
+  SUBJECTS=$(git log --pretty=%s "$RANGE")
+  BODIES=$(git log --pretty=%b "$RANGE")
   BREAKING=false
   TYPE=other
 
   # Check for breaking indicator: ! in subject OR BREAKING CHANGE trailer in body
-  if echo "$SUBJECT" | grep -qE '^[a-z]+(\(.+\))?!:' || echo "$BODY" | grep -qE 'BREAKING CHANGE'; then
+  if echo "$SUBJECTS" | grep -qE '^[a-z]+(\(.+\))?!:' || echo "$BODIES" | grep -qE 'BREAKING CHANGE'; then
     BREAKING=true
   fi
 
   # Determine type from conventional commit prefix
-  if echo "$SUBJECT" | grep -qE '^feat(\(.+\))?[!]?:'; then
+  if echo "$SUBJECTS" | grep -qE '^feat(\(.+\))?[!]?:'; then
     TYPE=feat
   fi
 
@@ -271,6 +278,45 @@ git tag v1.0.0
 make_commit "feat: post-graduation feature"
 TAG=$(compute_tag)
 assert_tag "feat from v1.0.0 → v1.1.0 (post-1.0 rules)" "v1.1.0" "$TAG"
+
+echo ""
+echo "=== Multi-commit push (type from full range, not HEAD only) ==="
+
+cleanup
+setup_repo
+unset GRADUATION_THRESHOLD
+make_commit "chore: init"
+git tag v0.3.18
+
+make_commit "feat: feature one"
+make_commit "feat: feature two"
+make_commit "fix(test): lint fix at HEAD"
+TAG=$(compute_tag)
+assert_tag "feat mid-push, fix at HEAD → minor" "v0.4.0" "$TAG"
+
+git tag v0.4.0
+make_commit "docs: only docs"
+make_commit "chore: only chores"
+TAG=$(compute_tag)
+assert_tag "no feat in range → patch" "v0.4.1" "$TAG"
+
+cleanup
+setup_repo
+make_commit "chore: init"
+git tag v1.0.0
+
+make_commit "feat: a feature"
+make_commit "refactor!: breaking mid-push"
+make_commit "fix: fix at HEAD"
+TAG=$(compute_tag)
+assert_tag "breaking mid-push, fix at HEAD → major" "v2.0.0" "$TAG"
+
+git tag v2.0.0
+make_commit "feat: counted"
+git tag v2.1.0
+make_commit "docs: after tag"
+TAG=$(compute_tag)
+assert_tag "commits before last tag not counted → patch" "v2.1.1" "$TAG"
 
 echo ""
 echo "════════════════════════"
