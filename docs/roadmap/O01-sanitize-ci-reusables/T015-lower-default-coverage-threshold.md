@@ -1,5 +1,5 @@
 ---
-estado: Specified
+estado: Completed
 tipo: task
 ---
 # T015: Bajar default `coverage-threshold` a 0 en `go-ci.yml`

@@ -1,5 +1,5 @@
 ---
-estado: Specified
+estado: Completed
 tipo: task
 ---
 # T017: Alinear `yamllint` y `actionlint` en line-length=160

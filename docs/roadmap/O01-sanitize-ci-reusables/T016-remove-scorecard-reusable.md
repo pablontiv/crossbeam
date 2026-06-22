@@ -1,5 +1,5 @@
 ---
-estado: Specified
+estado: Completed
 tipo: task
 ---
 # T016: Eliminar workflow Scorecard del set de reusables

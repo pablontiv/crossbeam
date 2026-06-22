@@ -1,5 +1,5 @@
 ---
-estado: Specified
+estado: Completed
 tipo: task
 ---
 # T018: Agrupar PRs de Dependabot para acciones menores
