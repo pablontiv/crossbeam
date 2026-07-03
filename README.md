@@ -64,6 +64,23 @@ release:
 
 See [Usage](#usage) for the full `.github/workflows/ci.yml` stub.
 
+### Profile Options
+
+Both `go-ci.yml` and `rust-ci.yml` support a `profile` input to control CI scope:
+
+- **`light` (default)**: Fast gate — build + test + coverage check (no -race on Go tests). Suitable for dev/PR workflows.
+- **`full`**: Comprehensive — adds tidy/lint/audit checks and enables -race on tests. For final quality gates before release.
+
+To use the previous "full" behavior by default, pass `with: profile: full`:
+
+```yaml
+ci:
+  uses: pablontiv/crossbeam/.github/workflows/go-ci.yml@v1
+  with:
+    profile: full
+    coverage-threshold: 85
+```
+
 ---
 
 ## Core Idea
@@ -174,7 +191,8 @@ Release workflows (`go-release.yml`, `rust-release.yml`) implement automatic ver
 
 | Topic | Description |
 |-------|-------------|
-| [go-ci.yml](.github/workflows/go-ci.yml) | Go CI: inputs, coverage threshold, lint gate |
+| [go-ci.yml](.github/workflows/go-ci.yml) | Go CI: profile (light/full), coverage threshold, lint gate |
+| [rust-ci.yml](.github/workflows/rust-ci.yml) | Rust CI: profile (light/full), toolchain, deny checks |
 | [go-release.yml](.github/workflows/go-release.yml) | Auto-tag + goreleaser: quality gates, graduation threshold |
 | [codeql.yml](.github/workflows/codeql.yml) | CodeQL: language input, nightly schedule |
 | [scorecard.yml](.github/workflows/scorecard.yml) | OpenSSF Scorecard: SARIF upload |

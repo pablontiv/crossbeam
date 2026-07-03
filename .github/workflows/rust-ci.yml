@@ -3,6 +3,11 @@ name: Rust CI
 on:
   workflow_call:
     inputs:
+      profile:
+        required: false
+        type: string
+        default: 'light'
+        description: "'light' runs test only; 'full' additionally runs check, lint, and audit"
       rust-toolchain:
         required: false
         type: string
@@ -28,6 +33,7 @@ env:
 jobs:
   check-lint:
     name: Check & Lint
+    if: inputs.profile == 'full'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -93,6 +99,7 @@ jobs:
 
   audit:
     name: Audit
+    if: inputs.profile == 'full'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
