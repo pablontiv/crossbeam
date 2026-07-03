@@ -3,6 +3,11 @@ name: Go CI
 on:
   workflow_call:
     inputs:
+      profile:
+        required: false
+        type: string
+        default: 'light'
+        description: "'light' runs build+test+coverage gate; 'full' additionally runs tidy, lint, and vulnerability check, and enables -race"
       go-version:
         required: false
         type: string
@@ -28,8 +33,8 @@ permissions:
   contents: read
 
 jobs:
-  build:
-    name: Build
+  test:
+    name: Test & Build
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -51,28 +56,13 @@ jobs:
       - name: Build
         run: go build ./...
 
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
-
-      - name: Setup Go
-        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
-        with:
-          go-version: ${{ inputs.go-version }}
-          go-version-file: ${{ inputs.go-version-file || '' }}
-
-      - name: Cache Go build
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v5.0.5
-        with:
-          path: ~/.cache/go-build
-          key: ${{ runner.os }}-gobuild-${{ hashFiles('**/*.go') }}
-          restore-keys: ${{ runner.os }}-gobuild-
-
       - name: Test with coverage
-        run: go test ./... -race -coverprofile=coverage.out
+        run: |
+          if [ "${{ inputs.profile }}" = "full" ]; then
+            go test ./... -race -coverprofile=coverage.out
+          else
+            go test ./... -coverprofile=coverage.out
+          fi
 
       - name: Check coverage threshold
         if: inputs.coverage-threshold > 0
@@ -86,6 +76,7 @@ jobs:
 
   tidy:
     name: Tidy
+    if: inputs.profile == 'full'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -105,6 +96,7 @@ jobs:
 
   lint:
     name: Lint
+    if: inputs.profile == 'full'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -123,6 +115,7 @@ jobs:
 
   vuln:
     name: Vulnerability check
+    if: inputs.profile == 'full'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
