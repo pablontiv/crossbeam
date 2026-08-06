@@ -28,6 +28,11 @@ on:
         type: number
         default: 5
         description: 'Minor version threshold for auto-graduation to v1.0.0. 0 disables.'
+      force-bump:
+        required: false
+        type: string
+        default: ''
+        description: 'Override the computed bump: major, minor, patch, or empty for automatic'
     secrets:
       GPG_PRIVATE_KEY:
         required: false
@@ -59,7 +64,16 @@ jobs:
         id: tag
         env:
           GRADUATION_THRESHOLD: ${{ inputs.graduation-threshold }}
+          FORCE_BUMP: ${{ inputs.force-bump }}
         run: |
+          case "$FORCE_BUMP" in
+            ""|major|minor|patch) ;;
+            *)
+              echo "::error::Invalid force-bump '$FORCE_BUMP': expected empty, major, minor, or patch"
+              exit 1
+              ;;
+          esac
+
           # Find latest semver tag
           LATEST=$(git tag -l 'v*' | sort -V | tail -1)
           if [[ -z "$LATEST" ]]; then
@@ -72,7 +86,7 @@ jobs:
           PATCH=$(echo "$LATEST" | sed 's/^v//' | cut -d. -f3)
 
           # Classify every commit since the last tag (a push may contain several
-          # commits); the highest-impact type wins: breaking > feat > other.
+          # commits); the highest-impact type wins: breaking > feat > fix/perf > other.
           if [[ "$LATEST" == "v0.0.0" ]]; then
             RANGE="HEAD"
           else
@@ -90,10 +104,35 @@ jobs:
 
           if echo "$SUBJECTS" | grep -qE '^feat(\(.+\))?[!]?:'; then
             TYPE=feat
+          elif echo "$SUBJECTS" | grep -qE '^fix(\(.+\))?[!]?:'; then
+            TYPE=fix
+          elif echo "$SUBJECTS" | grep -qE '^perf(\(.+\))?[!]?:'; then
+            TYPE=perf
           fi
 
-          # Apply bump table
-          if [[ $MAJOR -eq 0 ]]; then
+          # A manual override is release-worthy even when the range only contains
+          # maintenance commits. Without one, those ranges intentionally do not tag.
+          if [[ -z "$FORCE_BUMP" && "$BREAKING" != "true" && "$TYPE" == "other" ]]; then
+            echo "No release-worthy commits found (type=$TYPE, breaking=$BREAKING); skipping tag"
+            echo "new_tag=" >> "$GITHUB_OUTPUT"
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Apply the explicit override first, then the automatic bump table.
+          if [[ "$FORCE_BUMP" == "major" ]]; then
+            MAJOR=$((MAJOR + 1))
+            MINOR=0
+            PATCH=0
+            NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+          elif [[ "$FORCE_BUMP" == "minor" ]]; then
+            MINOR=$((MINOR + 1))
+            PATCH=0
+            NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+          elif [[ "$FORCE_BUMP" == "patch" ]]; then
+            PATCH=$((PATCH + 1))
+            NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
+          elif [[ $MAJOR -eq 0 ]]; then
             if [[ $GRADUATION_THRESHOLD -gt 0 && $MINOR -ge $GRADUATION_THRESHOLD && ("$TYPE" == "feat" || "$BREAKING" == "true") ]]; then
               NEW_TAG="v1.0.0"
             elif [[ "$TYPE" == "feat" || "$BREAKING" == "true" ]]; then
@@ -106,8 +145,7 @@ jobs:
             fi
           else
             if [[ "$BREAKING" == "true" ]]; then
-              MAJOR=$((MAJOR + 1))
-              MINOR=0
+              MINOR=$((MINOR + 1))
               PATCH=0
               NEW_TAG="v${MAJOR}.${MINOR}.${PATCH}"
             elif [[ "$TYPE" == "feat" ]]; then

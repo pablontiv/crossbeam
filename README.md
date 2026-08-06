@@ -181,9 +181,40 @@ This repository follows semver. Consumers reference `@v1` (major tag alias) to a
 
 Release workflows (`go-release.yml`, `rust-release.yml`) implement automatic version tagging based on [Conventional Commits](https://www.conventionalcommits.org/):
 
-**Pre-1.0:** `feat` → minor, `fix` → patch, breaking → minor
-**Post-1.0:** `feat` → minor, `fix` → patch, breaking → major
-**Auto-graduation:** When minor version reaches the configurable threshold (default 5), the next feature commit creates `v1.0.0`.
+| Commit range | Go release result |
+|--------------|-------------------|
+| Contains a breaking change | minor |
+| Contains `feat` | minor |
+| Contains `fix` or `perf` | patch |
+| Only `docs`, `test`, `refactor`, `ci`, `chore`, or `style` | no release |
+
+Breaking changes and features in `0.x` keep the existing graduation behavior: when the minor version reaches the configurable threshold (default 5), the next qualifying commit creates `v1.0.0`. Set `graduation-threshold: 0` to disable graduation.
+
+### Force a release bump
+
+`go-release.yml` accepts `force-bump` with an empty default. Set it to `major`, `minor`, or `patch` to override the computed bump. Any other value fails the tagging job.
+
+Expose the input through a caller's `workflow_dispatch` when maintainers need to cut a deliberate major release:
+
+```yaml
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      force-bump:
+        description: 'Override with major, minor, or patch; leave empty for automatic'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  release:
+    uses: pablontiv/crossbeam/.github/workflows/go-release.yml@v1
+    with:
+      quality-gate-jobs: '["test", "lint"]'
+      force-bump: ${{ inputs.force-bump || '' }}
+```
 
 ---
 
