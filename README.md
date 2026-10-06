@@ -168,7 +168,7 @@ snapshot:
   version_template: "{{ incpatch .Version }}-pr.{{ .Env.PR_NUMBER }}.g{{ .ShortCommit }}"
 ```
 
-This template is an explicit opt-in prerequisite. Existing Rootline and Roadmapctl release configurations are not compatible until they adopt it; that is expected and is not a defect in this reusable. Backscroll adoption is being handled separately in PR #105.
+This template is an explicit opt-in prerequisite. Existing Rootline and Roadmapctl release configurations are not compatible until they adopt it; that is expected and is not a defect in this reusable. Backscroll adopted the template in merged PR #105, released in v3.10.1.
 
 The PR must be rebased so `base-sha` is an ancestor of `source-sha`. If the base branch changes, regenerate the candidate with the new base SHA.
 
@@ -251,7 +251,7 @@ The workflow isolates trust boundaries across fresh jobs:
 
 1. `metadata` reads only the PR API and the public caller Git graph.
 2. `build` has no repository permission, installs the exact Go toolchain and GoReleaser before fetching source, uses only the base-SHA GoReleaser config, and uploads one bounded raw artifact.
-3. `static-validate` downloads that exact artifact ID and validates the direct-list GoReleaser manifest, one-to-one checksums, the six-target Linux/Darwin/Windows amd64/arm64 matrix, exact compiler version, executable headers, safe modes, and every archive member without executing the candidate. Unix archives require one root `binary-name`; Windows archives require one root `binary-name.exe`. Additional regular documentation paths are allowed when canonical and safe.
+3. `static-validate` downloads that exact artifact ID and validates the direct-list GoReleaser manifest, one-to-one checksums, the six-target Linux/Darwin/Windows amd64/arm64 matrix, exact compiler version, executable headers, safe modes, and every archive member without executing the candidate. Unix archives require one root `binary-name`; Windows archives require one root `binary-name.exe`. Every other member must be bounded UTF-8 documentation: a root `LICENSE`, `README`, `CHANGELOG`, or `NOTICE` variant (`.md`/`.txt` allowed), or a canonical `docs/*.md` path. Arbitrary payloads, code, libraries, executable documentation, binary content, NUL bytes, and control characters are rejected.
 4. `smoke` downloads the same artifact ID, safely materializes only the Linux/amd64 binary, and executes it as the final step under an empty environment and temporary HOME/XDG/database paths.
 5. `publish` runs fresh only after static validation and smoke succeed, downloads the same immutable raw artifact, regenerates `candidate.json`, and uploads the final allowlisted artifact.
 

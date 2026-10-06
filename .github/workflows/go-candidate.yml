@@ -249,6 +249,45 @@ jobs:
           git -C source show "${BASE_SHA}:${GORELEASER_CONFIG}" > "$trusted_config"
           printf '%s\n' "$trusted_config" > "$RUNNER_TEMP/trusted-config-path"
 
+      - name: Snapshot source workspace before build
+        env:
+          SNAPSHOT_PATH: ${{ runner.temp }}/source-snapshot-before.json
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import stat
+
+          root = Path("source")
+          entries = []
+
+          def visit(directory, relative=Path()):
+              for entry in sorted(os.scandir(directory), key=lambda item: item.name):
+                  child = relative / entry.name
+                  if child.parts[0] in (".git", "dist"):
+                      continue
+                  info = entry.stat(follow_symlinks=False)
+                  mode = stat.S_IMODE(info.st_mode)
+                  if stat.S_ISLNK(info.st_mode):
+                      entries.append({"path": child.as_posix(), "type": "symlink", "mode": mode, "target": os.readlink(entry.path)})
+                  elif stat.S_ISDIR(info.st_mode):
+                      entries.append({"path": child.as_posix(), "type": "directory", "mode": mode})
+                      visit(entry.path, child)
+                  elif stat.S_ISREG(info.st_mode):
+                      digest = hashlib.sha256()
+                      with open(entry.path, "rb") as stream:
+                          for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                              digest.update(chunk)
+                      entries.append({"path": child.as_posix(), "type": "file", "mode": mode, "sha256": digest.hexdigest()})
+                  else:
+                      entries.append({"path": child.as_posix(), "type": "special", "mode": mode})
+
+          visit(root)
+          Path(os.environ["SNAPSHOT_PATH"]).write_text(json.dumps(entries, separators=(",", ":"), sort_keys=True) + "\n")
+          PY
+
       - name: Build candidate with sanitized environment
         env:
           PR_NUMBER: ${{ inputs.pr-number }}
@@ -263,10 +302,10 @@ jobs:
             PR_NUMBER="$PR_NUMBER" \
             goreleaser release --snapshot --clean --config "$trusted_config"
 
-      - name: Bound and stage raw dist
+      - name: Verify source workspace after build
         env:
-          RAW_ROOT: ${{ runner.temp }}/candidate-raw
           SOURCE_SHA: ${{ needs.metadata.outputs.source-sha }}
+          SNAPSHOT_PATH: ${{ runner.temp }}/source-snapshot-before.json
         run: |
           if [[ "$(git -C source rev-parse HEAD)" != "$SOURCE_SHA" ]]; then
             echo "::error::source HEAD changed during GoReleaser"
@@ -278,6 +317,47 @@ jobs:
             printf '%s\n' "$source_status"
             exit 1
           fi
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import stat
+
+          root = Path("source")
+          entries = []
+
+          def visit(directory, relative=Path()):
+              for entry in sorted(os.scandir(directory), key=lambda item: item.name):
+                  child = relative / entry.name
+                  if child.parts[0] in (".git", "dist"):
+                      continue
+                  info = entry.stat(follow_symlinks=False)
+                  mode = stat.S_IMODE(info.st_mode)
+                  if stat.S_ISLNK(info.st_mode):
+                      entries.append({"path": child.as_posix(), "type": "symlink", "mode": mode, "target": os.readlink(entry.path)})
+                  elif stat.S_ISDIR(info.st_mode):
+                      entries.append({"path": child.as_posix(), "type": "directory", "mode": mode})
+                      visit(entry.path, child)
+                  elif stat.S_ISREG(info.st_mode):
+                      digest = hashlib.sha256()
+                      with open(entry.path, "rb") as stream:
+                          for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                              digest.update(chunk)
+                      entries.append({"path": child.as_posix(), "type": "file", "mode": mode, "sha256": digest.hexdigest()})
+                  else:
+                      entries.append({"path": child.as_posix(), "type": "special", "mode": mode})
+
+          visit(root)
+          before = json.loads(Path(os.environ["SNAPSHOT_PATH"]).read_text())
+          if entries != before:
+              raise SystemExit("::error::source workspace changed outside designated dist directory")
+          PY
+
+      - name: Bound and stage raw dist
+        env:
+          RAW_ROOT: ${{ runner.temp }}/candidate-raw
+        run: |
           python3 - <<'PY'
           import json
           import os
@@ -331,9 +411,14 @@ jobs:
               safe_file(item.get("path"), 4 * 1024 * 1024 if item.get("type") == "Checksum" else 256 * 1024 * 1024)
               for item in selected
           ]
+          declared_names = [path.name for path in selected_files]
+          reserved = {"candidate.json", "artifacts.json", "metadata.json"}
+          if (len(declared_names) != 7 or len({name.casefold() for name in declared_names}) != len(declared_names)
+                  or {name.casefold() for name in declared_names} & reserved):
+              raise SystemExit("::error::declared archive/checksum basenames collide or are reserved")
           files = [artifacts_path, metadata_path, *selected_files]
-          if len({path.name.casefold() for path in files}) != len(files):
-              raise SystemExit("::error::raw basenames collide")
+          if len(files) != 9 or len({path.name.casefold() for path in files}) != len(files):
+              raise SystemExit("::error::raw basenames or cardinality are invalid")
           total = sum(path.stat().st_size for path in files)
           if total > 1024 * 1024 * 1024 or any(path.stat().st_size > 256 * 1024 * 1024 for path in files):
               raise SystemExit("::error::raw artifact size limit exceeded")
@@ -344,6 +429,11 @@ jobs:
           target_dist.mkdir(parents=True)
           for path in sorted(files, key=lambda item: item.name):
               shutil.copy2(path, target_dist / path.name)
+          expected_staged = sorted(path.name for path in files)
+          actual_staged = sorted(path.name for path in target_dist.iterdir())
+          if len(actual_staged) != 9 or actual_staged != expected_staged or any(
+                  path.is_symlink() or not path.is_file() for path in target_dist.iterdir()):
+              raise SystemExit("::error::raw staging inventory or cardinality mismatch")
           PY
 
       - name: Upload raw candidate dist
@@ -410,6 +500,7 @@ jobs:
           MAX_EXPANDED = 512 * 1024 * 1024
           MAX_RATIO = 200
           MAX_CONTROL = 4 * 1024 * 1024
+          MAX_DOCUMENT = 4 * 1024 * 1024
           EXPECTED_MATRIX = {
               ("linux", "amd64"), ("linux", "arm64"),
               ("darwin", "amd64"), ("darwin", "arm64"),
@@ -454,12 +545,17 @@ jobs:
 
           archive_paths = [(item, raw_path(item, MAX_ARCHIVE)) for item in archives]
           checksum_path = raw_path(checksum_items[0], MAX_CONTROL)
-          expected_files = {"artifacts.json", "metadata.json", checksum_path.name, *(path.name for _, path in archive_paths)}
-          actual_files = {path.name for path in dist.iterdir() if path.is_file() and not path.is_symlink()}
-          if actual_files != expected_files or len(list(dist.iterdir())) != len(expected_files):
-              raise SystemExit("::error::raw dist inventory does not exactly match declarations")
-          if len({name.casefold() for name in expected_files}) != len(expected_files):
-              raise SystemExit("::error::raw filename casefold collision")
+          declared_names = [path.name for _, path in archive_paths] + [checksum_path.name]
+          reserved = {"candidate.json", "artifacts.json", "metadata.json"}
+          if (len(declared_names) != 7 or len({name.casefold() for name in declared_names}) != len(declared_names)
+                  or {name.casefold() for name in declared_names} & reserved):
+              raise SystemExit("::error::declared raw basenames collide or are reserved")
+          expected_files = ["artifacts.json", "metadata.json", *declared_names]
+          actual_entries = list(dist.iterdir())
+          actual_files = [path.name for path in actual_entries]
+          if (len(expected_files) != 9 or len(actual_files) != 9 or sorted(actual_files) != sorted(expected_files)
+                  or any(path.is_symlink() or not path.is_file() for path in actual_entries)):
+              raise SystemExit("::error::raw dist inventory and cardinality do not exactly match declarations")
 
           checksums = {}
           for line in checksum_path.read_text().splitlines():
@@ -467,10 +563,10 @@ jobs:
               if not match or match.group(2).startswith(".") or match.group(2) in checksums:
                   raise SystemExit("::error::invalid or duplicate checksum")
               checksums[match.group(2)] = match.group(1).lower()
-          archive_names = {path.name for _, path in archive_paths}
-          if len(archive_names) != len(archive_paths):
+          archive_names = [path.name for _, path in archive_paths]
+          if len(archive_names) != 6 or len({name.casefold() for name in archive_names}) != 6:
               raise SystemExit("::error::declared archive paths are duplicated")
-          if set(checksums) != archive_names:
+          if len(checksums) != 6 or set(checksums) != set(archive_names):
               raise SystemExit("::error::checksums do not map one-to-one to archives")
 
           metadata = json.loads(metadata_path.read_text())
@@ -495,6 +591,23 @@ jobs:
                       or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", part) for part in parts):
                   raise SystemExit("::error::archive member path is noncanonical, hidden, traversing, or unsafe")
               return parts
+
+          def validate_document_path(parts):
+              root_document = len(parts) == 1 and re.fullmatch(
+                  r"(LICENSE|README|CHANGELOG|NOTICE)(\.md|\.txt)?", parts[0])
+              nested_markdown = len(parts) >= 2 and parts[0] == "docs" and parts[-1].endswith(".md")
+              if not root_document and not nested_markdown:
+                  raise SystemExit("::error::non-binary archive member is not an allowed documentation path")
+
+          def validate_document_payload(data):
+              if len(data) > MAX_DOCUMENT:
+                  raise SystemExit("::error::documentation payload exceeds size limit")
+              try:
+                  text = data.decode("utf-8")
+              except UnicodeDecodeError:
+                  raise SystemExit("::error::documentation payload is not UTF-8")
+              if any((ord(char) < 32 and char not in "\t\n\r") or ord(char) == 127 for char in text):
+                  raise SystemExit("::error::documentation payload contains binary or control data")
 
           def validate_members(records, archive_size, expected_binary):
               if not 1 <= len(records) <= MAX_ENTRIES:
@@ -526,8 +639,12 @@ jobs:
                           raise SystemExit("::error::binary is not executable")
                       binary_key = key
                       binary_size = size
-                  elif permissions & 0o111:
-                      raise SystemExit("::error::documentation member must not be executable")
+                  else:
+                      if permissions & 0o111:
+                          raise SystemExit("::error::documentation member must not be executable")
+                      validate_document_path(parts)
+                      if size > MAX_DOCUMENT:
+                          raise SystemExit("::error::documentation member exceeds size limit before payload read")
               if expanded > MAX_EXPANDED or expanded > max(archive_size, 1) * MAX_RATIO:
                   raise SystemExit("::error::archive expanded size or ratio limit exceeded")
               if binary_key is None:
@@ -689,11 +806,17 @@ jobs:
                           if is_binary:
                               if len(parts) != 1 or name != expected_binary or binary_data is not None or not permissions & 0o111:
                                   raise SystemExit("::error::TAR binary name, root path, uniqueness, or mode mismatch")
-                          elif permissions & 0o111:
-                              raise SystemExit("::error::TAR documentation member must not be executable")
-                          payload = read_exact(stream, size, capture=is_binary)
+                          else:
+                              if permissions & 0o111:
+                                  raise SystemExit("::error::TAR documentation member must not be executable")
+                              validate_document_path(parts)
+                              if size > MAX_DOCUMENT:
+                                  raise SystemExit("::error::TAR documentation exceeds size limit before payload read")
+                          payload = read_exact(stream, size, capture=True)
                           if is_binary:
                               binary_data = payload
+                          else:
+                              validate_document_payload(payload)
                           padding = (-size) % 512
                           if padding:
                               read_exact(stream, padding, capture=False)
@@ -756,9 +879,11 @@ jobs:
                       for index, info in enumerate(infos):
                           local_zip_name(archive, info)
                           with bundle.open(info) as stream:
-                              payload = read_member_bounded(stream, info.file_size, capture=index == binary_index)
+                              payload = read_member_bounded(stream, info.file_size, capture=True)
                           if index == binary_index:
                               binary_data = payload
+                          else:
+                              validate_document_payload(payload)
                       if len(binary_data) != binary_size:
                           raise SystemExit("::error::ZIP binary size differs from validated metadata")
               else:
@@ -953,6 +1078,7 @@ jobs:
           BASE_VERSION: ${{ needs.metadata.outputs.base-version }}
           CANDIDATE_VERSION: ${{ needs.metadata.outputs.candidate-version }}
           PR_NUMBER: ${{ inputs.pr-number }}
+          BINARY_NAME: ${{ inputs.binary-name }}
         run: |
           python3 - <<'PY'
           import hashlib
@@ -978,30 +1104,60 @@ jobs:
               raise SystemExit("::error::invalid artifacts.json")
           archives = [item for item in artifacts if item.get("type") == "Archive"]
           checksum_items = [item for item in artifacts if item.get("type") == "Checksum"]
-          if not archives or len(checksum_items) != 1:
-              raise SystemExit("::error::invalid publish inventory")
+          expected_matrix = {
+              ("linux", "amd64"), ("linux", "arm64"),
+              ("darwin", "amd64"), ("darwin", "arm64"),
+              ("windows", "amd64"), ("windows", "arm64"),
+          }
+          matrix = [(item.get("goos"), item.get("goarch")) for item in archives]
+          if (len(archives) != 6 or not all(isinstance(value, str) for platform in matrix for value in platform)
+                  or len(set(matrix)) != 6 or set(matrix) != expected_matrix or len(checksum_items) != 1):
+              raise SystemExit("::error::invalid publish six-target scalar inventory")
 
           def declared_path(item):
               raw = item.get("path")
               parts = PurePosixPath(raw).parts if isinstance(raw, str) else ()
-              if len(parts) != 2 or parts[0] != "dist" or any(part in ("", ".", "..") or part.startswith(".") for part in parts):
+              if (len(parts) != 2 or parts[0] != "dist" or "/".join(parts) != raw
+                      or any(part in ("", ".", "..") or part.startswith(".") for part in parts)):
                   raise SystemExit("::error::unsafe publish path")
               return regular(root / Path(*parts))
 
           archive_paths = [(item, declared_path(item)) for item in archives]
           checksum_path = declared_path(checksum_items[0])
-          expected = {"artifacts.json", "metadata.json", checksum_path.name, *(path.name for _, path in archive_paths)}
-          actual = {path.name for path in dist.iterdir() if path.is_file() and not path.is_symlink()}
-          if actual != expected or len(list(dist.iterdir())) != len(expected) or len({name.casefold() for name in expected}) != len(expected):
-              raise SystemExit("::error::publish inventory mismatch")
+          declared_names = [path.name for _, path in archive_paths] + [checksum_path.name]
+          reserved = {"candidate.json", "artifacts.json", "metadata.json"}
+          if (len(declared_names) != 7 or len({name.casefold() for name in declared_names}) != 7
+                  or {name.casefold() for name in declared_names} & reserved):
+              raise SystemExit("::error::publish declared basenames collide or are reserved")
+          expected = ["artifacts.json", "metadata.json", *declared_names]
+          actual_entries = list(dist.iterdir())
+          actual = [path.name for path in actual_entries]
+          if (len(expected) != 9 or len(actual) != 9 or sorted(actual) != sorted(expected)
+                  or any(path.is_symlink() or not path.is_file() for path in actual_entries)):
+              raise SystemExit("::error::publish inventory or cardinality mismatch")
           checksums = {}
           for line in checksum_path.read_text().splitlines():
               match = re.fullmatch(r"([0-9a-fA-F]{64})  ([A-Za-z0-9][A-Za-z0-9._-]*)", line)
               if not match or match.group(2) in checksums:
                   raise SystemExit("::error::invalid publish checksum")
               checksums[match.group(2)] = match.group(1).lower()
-          if set(checksums) != {path.name for _, path in archive_paths}:
+          archive_names = [path.name for _, path in archive_paths]
+          if len(checksums) != 6 or set(checksums) != set(archive_names):
               raise SystemExit("::error::publish checksums are not one-to-one")
+          source_sha = os.environ["SOURCE_SHA"]
+          base_sha = os.environ["BASE_SHA"]
+          base_version = os.environ["BASE_VERSION"]
+          candidate_version = os.environ["CANDIDATE_VERSION"]
+          pr_number = os.environ["PR_NUMBER"]
+          binary_name = os.environ["BINARY_NAME"]
+          if not re.fullmatch(r"[0-9a-f]{40}", source_sha) or not re.fullmatch(r"[0-9a-f]{40}", base_sha):
+              raise SystemExit("::error::manifest SHA scalar is invalid")
+          if not re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", base_version):
+              raise SystemExit("::error::manifest base version scalar is invalid")
+          if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-pr\.[1-9][0-9]*\.g[0-9a-f]{7}", candidate_version):
+              raise SystemExit("::error::manifest candidate version scalar is invalid")
+          if not re.fullmatch(r"[1-9][0-9]*", pr_number) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", binary_name):
+              raise SystemExit("::error::manifest PR or binary scalar is invalid")
           metadata = json.loads(regular(dist / "metadata.json").read_text())
           if metadata.get("version") != os.environ["CANDIDATE_VERSION"] or str(metadata.get("commit", "")).lower() != os.environ["SOURCE_SHA"]:
               raise SystemExit("::error::publish metadata mismatch")
@@ -1020,9 +1176,9 @@ jobs:
                   raise SystemExit("::error::publish archive checksum mismatch")
               manifest_archives.append({
                   "file": path.name,
-                  "goarch": item.get("goarch"),
-                  "goos": item.get("goos"),
-                  "name": item.get("name", path.name),
+                  "goarch": item["goarch"],
+                  "goos": item["goos"],
+                  "name": binary_name,
                   "sha256": digest,
               })
           stage = Path("candidate-upload")
@@ -1034,17 +1190,20 @@ jobs:
           shutil.copy2(checksum_path, stage / checksum_path.name)
           manifest = {
               "archives": manifest_archives,
-              "base": os.environ["BASE_SHA"],
-              "base_version": os.environ["BASE_VERSION"],
-              "candidate_version": os.environ["CANDIDATE_VERSION"],
-              "pr": int(os.environ["PR_NUMBER"]),
+              "base": base_sha,
+              "base_version": base_version,
+              "candidate_version": candidate_version,
+              "pr": int(pr_number),
               "schema": 1,
-              "sha": os.environ["SOURCE_SHA"],
+              "sha": source_sha,
           }
           (stage / "candidate.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-          expected_stage = {path.name for _, path in archive_paths} | {checksum_path.name, "candidate.json"}
-          if {path.name for path in stage.iterdir()} != expected_stage or any(path.is_symlink() or not path.is_file() for path in stage.iterdir()):
-              raise SystemExit("::error::final stage allowlist mismatch")
+          expected_stage = sorted([*archive_names, checksum_path.name, "candidate.json"])
+          actual_stage_entries = list(stage.iterdir())
+          actual_stage = sorted(path.name for path in actual_stage_entries)
+          if (len(expected_stage) != 8 or len(actual_stage) != 8 or actual_stage != expected_stage
+                  or any(path.is_symlink() or not path.is_file() for path in actual_stage_entries)):
+              raise SystemExit("::error::final stage allowlist or cardinality mismatch")
           artifact_name = f"go-candidate-pr-{os.environ['PR_NUMBER']}-{os.environ['SOURCE_SHA']}"
           with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
               print(f"artifact_name={artifact_name}", file=output)

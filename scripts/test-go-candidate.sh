@@ -56,6 +56,8 @@ PY
 }
 
 extract_step "Validate PR and base graph" "$TEST_ROOT/metadata.sh"
+extract_step "Snapshot source workspace before build" "$TEST_ROOT/snapshot-before.sh"
+extract_step "Verify source workspace after build" "$TEST_ROOT/verify-after.sh"
 extract_step "Bound and stage raw dist" "$TEST_ROOT/stage-raw.sh"
 extract_step "Validate raw candidate statically" "$TEST_ROOT/static.sh"
 extract_step "Extract only validated smoke binary" "$TEST_ROOT/extract.sh"
@@ -292,6 +294,13 @@ for goos, goarch in platforms:
                 add_zip(bundle, binary_name, payload, 0o755)
                 add_zip(bundle, "README.md", b"representative roadmapctl docs", 0o644)
                 if goarch == "arm64": add_zip(bundle, "docs/USAGE.md", b"nested regular docs", 0o644)
+                malware = {
+                    "windows-malware-exe": "malware.exe",
+                    "windows-malware-dll": "malware.dll",
+                    "windows-malware-cmd": "malware.cmd",
+                    "windows-malware-ps1": "malware.ps1",
+                }.get(mode)
+                if malware and goarch == "amd64": add_zip(bundle, malware, b"not documentation", 0o644)
     else:
         with tarfile.open(archive, "w:gz") as bundle:
             is_primary = (goos, goarch) == ("linux", "amd64")
@@ -319,6 +328,10 @@ for goos, goarch in platforms:
             elif is_primary and mode == "binary-world-write": add_tar(bundle, "tool", payload, 0o777)
             elif is_primary and mode == "binary-setuid": add_tar(bundle, "tool", payload, 0o4755)
             elif is_primary and mode == "docs-executable": add_tar(bundle, "tool", payload, 0o755); add_tar(bundle, "README.md", b"x", 0o755)
+            elif is_primary and mode == "arbitrary-payload": add_tar(bundle, "tool", payload, 0o755); add_tar(bundle, "payload.bin", b"arbitrary", 0o644)
+            elif is_primary and mode == "binary-document": add_tar(bundle, "tool", payload, 0o755); add_tar(bundle, "README.md", b"text\x00binary", 0o644)
+            elif is_primary and mode == "invalid-utf8-document": add_tar(bundle, "tool", payload, 0o755); add_tar(bundle, "README.md", b"\xff\xfe", 0o644)
+            elif is_primary and mode == "control-document": add_tar(bundle, "tool", payload, 0o755); add_tar(bundle, "README.md", b"text\x07control", 0o644)
             else:
                 add_tar(bundle, expected_binary, payload, 0o755)
                 docs = b"representative backscroll docs" if goos == "linux" else b"representative rootline docs"
@@ -387,7 +400,16 @@ if mode == "checksum-mismatch": checksum_lines[0] = "0" * 64 + checksum_lines[0]
 if mode == "checksum-extra": checksum_lines.append("0" * 64 + "  extra.tar.gz")
 if mode == "checksum-duplicate": checksum_lines.append(checksum_lines[0])
 (dist / "checksums.txt").write_text("\n".join(checksum_lines) + "\n")
-artifacts = archives + [{"type": "Checksum", "name": "checksums", "path": "dist/checksums.txt"}]
+if mode == "reserved-archive":
+    (dist / "candidate.json").write_bytes((dist / Path(archives[0]["path"]).name).read_bytes())
+    archives[0]["path"] = "dist/candidate.json"
+if mode == "duplicate-archive-path":
+    archives[1]["path"] = archives[0]["path"]
+if mode == "untrusted-artifact-name":
+    for item in archives: item["name"] = {"untrusted": ["object"]}
+checksum_item = {"type": "Checksum", "name": "checksums", "path": "dist/checksums.txt"}
+if mode == "reserved-checksum": checksum_item["path"] = "dist/metadata.json"
+artifacts = archives + [checksum_item]
 if mode == "wrapper-shape": artifacts = {"artifacts": artifacts}
 (dist / "artifacts.json").write_text(json.dumps(artifacts))
 if mode == "config-extra": (dist / "config.yaml").write_text("should not be uploaded\n")
@@ -408,31 +430,43 @@ make_raw "$stage_fixture/generated" config-extra
 mkdir -p "$stage_fixture/source"
 git init -b main "$stage_fixture/source" >/dev/null
 configure_git "$stage_fixture/source"
-printf 'dist/\n' > "$stage_fixture/source/.gitignore"
+printf 'dist/\nignored-generated.txt\n' > "$stage_fixture/source/.gitignore"
 printf 'trusted\n' > "$stage_fixture/source/tracked.txt"
 git -C "$stage_fixture/source" add .gitignore tracked.txt
 git -C "$stage_fixture/source" commit -m "chore: stage fixture" >/dev/null
 stage_sha=$(git -C "$stage_fixture/source" rev-parse HEAD)
+snapshot_path="$stage_fixture/source-snapshot.json"
+expect_status "pre-build workspace snapshot succeeds" success "$stage_fixture/snapshot.log" \
+  env SNAPSHOT_PATH="$snapshot_path" bash -c "cd '$stage_fixture' && '$TEST_ROOT/snapshot-before.sh'"
 cp -R "$stage_fixture/generated/raw/dist" "$stage_fixture/source/dist"
-expect_status "clean exact HEAD stages only raw allowlist" success "$stage_fixture/clean.log" \
-  env SOURCE_SHA="$stage_sha" RAW_ROOT="$stage_fixture/staged" \
-  bash -c "cd '$stage_fixture' && '$TEST_ROOT/stage-raw.sh'"
+expect_status "clean exact HEAD and workspace snapshot pass" success "$stage_fixture/clean.log" \
+  env SOURCE_SHA="$stage_sha" SNAPSHOT_PATH="$snapshot_path" \
+  bash -c "cd '$stage_fixture' && '$TEST_ROOT/verify-after.sh'"
+expect_status "clean build stages only raw allowlist" success "$stage_fixture/stage.log" \
+  env RAW_ROOT="$stage_fixture/staged" bash -c "cd '$stage_fixture' && '$TEST_ROOT/stage-raw.sh'"
 staged_count=$(find "$stage_fixture/staged/dist" -maxdepth 1 -type f | wc -l | tr -d ' ')
 record "raw stage has control files checksum and six archives" 9 "$staged_count"
 record "raw stage excludes config.yaml" absent "$([[ -e "$stage_fixture/staged/dist/config.yaml" ]] && echo present || echo absent)"
 printf 'mutated\n' >> "$stage_fixture/source/tracked.txt"
 expect_status "tracked build mutation rejected" failure "$stage_fixture/mutation.log" \
-  env SOURCE_SHA="$stage_sha" RAW_ROOT="$stage_fixture/rejected-mutation" \
-  bash -c "cd '$stage_fixture' && '$TEST_ROOT/stage-raw.sh'"
+  env SOURCE_SHA="$stage_sha" SNAPSHOT_PATH="$snapshot_path" \
+  bash -c "cd '$stage_fixture' && '$TEST_ROOT/verify-after.sh'"
 git -C "$stage_fixture/source" checkout -- tracked.txt
 printf 'hook output\n' > "$stage_fixture/source/hook-output.txt"
 expect_status "untracked hook output rejected" failure "$stage_fixture/hook.log" \
-  env SOURCE_SHA="$stage_sha" RAW_ROOT="$stage_fixture/rejected-hook" \
-  bash -c "cd '$stage_fixture' && '$TEST_ROOT/stage-raw.sh'"
+  env SOURCE_SHA="$stage_sha" SNAPSHOT_PATH="$snapshot_path" \
+  bash -c "cd '$stage_fixture' && '$TEST_ROOT/verify-after.sh'"
 rm "$stage_fixture/source/hook-output.txt"
+printf 'ignored mutation\n' > "$stage_fixture/source/ignored-generated.txt"
+record "ignored mutation is absent from git status" clean \
+  "$([[ -z "$(git -C "$stage_fixture/source" status --porcelain --untracked-files=all)" ]] && echo clean || echo dirty)"
+expect_status "ignored generated source rejected by workspace snapshot" failure "$stage_fixture/ignored.log" \
+  env SOURCE_SHA="$stage_sha" SNAPSHOT_PATH="$snapshot_path" \
+  bash -c "cd '$stage_fixture' && '$TEST_ROOT/verify-after.sh'"
+rm "$stage_fixture/source/ignored-generated.txt"
 expect_status "changed HEAD rejected" failure "$stage_fixture/head.log" \
-  env SOURCE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb RAW_ROOT="$stage_fixture/rejected-head" \
-  bash -c "cd '$stage_fixture' && '$TEST_ROOT/stage-raw.sh'"
+  env SOURCE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb SNAPSHOT_PATH="$snapshot_path" \
+  bash -c "cd '$stage_fixture' && '$TEST_ROOT/verify-after.sh'"
 
 run_static_case() {
   local name=$1 mode=$2 expected=$3 expected_go=${4:-$go_version}
@@ -486,10 +520,21 @@ run_static_case "non-executable binary rejected" binary-nonexec failure
 run_static_case "world-writable binary rejected" binary-world-write failure
 run_static_case "setuid binary rejected" binary-setuid failure
 run_static_case "executable documentation rejected" docs-executable failure
+run_static_case "arbitrary TAR payload rejected" arbitrary-payload failure
+run_static_case "binary documentation payload rejected" binary-document failure
+run_static_case "invalid UTF-8 documentation rejected" invalid-utf8-document failure
+run_static_case "control characters in documentation rejected" control-document failure
+run_static_case "Windows malware exe rejected even non-executable" windows-malware-exe failure
+run_static_case "Windows malware dll rejected even non-executable" windows-malware-dll failure
+run_static_case "Windows malware cmd rejected even non-executable" windows-malware-cmd failure
+run_static_case "Windows malware ps1 rejected even non-executable" windows-malware-ps1 failure
 run_static_case "checksum mismatch rejected" checksum-mismatch failure
 run_static_case "extra checksum rejected" checksum-extra failure
 run_static_case "duplicate checksum rejected" checksum-duplicate failure
 run_static_case "wrapped speculative artifacts shape rejected" wrapper-shape failure
+run_static_case "reserved archive basename rejected" reserved-archive failure
+run_static_case "reserved checksum basename rejected" reserved-checksum failure
+run_static_case "duplicate archive path rejected without set masking" duplicate-archive-path failure
 run_static_case "raw config and intermediates excluded" config-extra failure
 run_static_case "ELF architecture label mismatch rejected" header-linux failure
 run_static_case "Mach-O architecture label mismatch rejected" header-darwin failure
@@ -564,10 +609,38 @@ expect_status "smoke version failure blocks success" failure "$smoke_dir/smoke-f
   env PATH="$mock_bin:$PATH" SANDBOX="$sandbox" SMOKE_BINARY="$binary" \
   CANDIDATE_VERSION=9.9.9-bad "$TEST_ROOT/smoke.sh"
 record "failed smoke creates no final staging" absent "$([[ -e "$smoke_dir/candidate-upload" ]] && echo present || echo absent)"
+python3 - "$smoke_dir/raw/dist/artifacts.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+artifacts = json.loads(path.read_text())
+for item in artifacts:
+    if item.get("type") == "Archive":
+        item["name"] = {"untrusted": ["must not reach manifest"]}
+path.write_text(json.dumps(artifacts))
+PY
+run_publish_invalid() {
+  local name=$1 source=$2 base=$3 base_version=$4 version=$5 pr=$6 binary_name=$7
+  expect_status "$name" failure "$smoke_dir/${name// /-}.log" \
+    env SOURCE_SHA="$source" BASE_SHA="$base" BASE_VERSION="$base_version" \
+    CANDIDATE_VERSION="$version" PR_NUMBER="$pr" BINARY_NAME="$binary_name" \
+    GITHUB_OUTPUT="$smoke_dir/invalid-output" bash -c "cd '$smoke_dir' && '$TEST_ROOT/publish.sh'"
+}
+run_publish_invalid "manifest rejects uppercase source SHA" "${fixture_sha^^}" \
+  bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb v1.2.3 "$candidate_version" 42 tool
+run_publish_invalid "manifest rejects malformed base SHA" "$fixture_sha" short \
+  v1.2.3 "$candidate_version" 42 tool
+run_publish_invalid "manifest rejects malformed base version" "$fixture_sha" \
+  bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb 1.2.3 "$candidate_version" 42 tool
+run_publish_invalid "manifest rejects malformed candidate version" "$fixture_sha" \
+  bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb v1.2.3 bad-version 42 tool
+run_publish_invalid "manifest rejects unsafe binary scalar" "$fixture_sha" \
+  bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb v1.2.3 "$candidate_version" 42 ../tool
 publish_output="$smoke_dir/publish-output"
-expect_status "publish revalidation and manifest succeed" success "$smoke_dir/publish.log" \
+expect_status "publish ignores untrusted artifact names" success "$smoke_dir/publish.log" \
   env SOURCE_SHA="$fixture_sha" BASE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
-  BASE_VERSION=v1.2.3 CANDIDATE_VERSION="$candidate_version" PR_NUMBER=42 \
+  BASE_VERSION=v1.2.3 CANDIDATE_VERSION="$candidate_version" PR_NUMBER=42 BINARY_NAME=tool \
   GITHUB_OUTPUT="$publish_output" bash -c "cd '$smoke_dir' && '$TEST_ROOT/publish.sh'"
 published_count=$(find "$smoke_dir/candidate-upload" -maxdepth 1 -type f | wc -l | tr -d ' ')
 record "final allowlist contains six archives checksum and manifest" 8 "$published_count"
@@ -584,7 +657,8 @@ expected = {
     ("windows", "amd64"), ("windows", "arm64"),
 }
 matrix = {(item["goos"], item["goarch"]) for item in value["archives"]}
-valid = list(value) == sorted(value) and value["archives"] == sorted(value["archives"], key=lambda item: item["file"]) and matrix == expected
+names = {item["name"] for item in value["archives"]}
+valid = list(value) == sorted(value) and value["archives"] == sorted(value["archives"], key=lambda item: item["file"]) and matrix == expected and names == {"tool"}
 print("valid" if valid else "invalid")
 PY
 )
