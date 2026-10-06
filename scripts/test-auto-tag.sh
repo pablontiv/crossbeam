@@ -54,6 +54,27 @@ output.write_text("\n".join(body) + "\n")
 PY
 }
 
+extract_checksum_script() {
+  python3 - "$WORKFLOW" "$TEST_ROOT/verify-checksums.sh" <<'PY'
+from pathlib import Path
+import sys
+
+workflow = Path(sys.argv[1]).read_text().splitlines()
+output = Path(sys.argv[2])
+
+step = next(i for i, line in enumerate(workflow) if line == "      - name: Verify release checksums")
+run = next(i for i in range(step + 1, len(workflow)) if workflow[i] == "        run: |")
+
+body = []
+for line in workflow[run + 1:]:
+    if line and not line.startswith("          "):
+        break
+    body.append(line[10:] if line else "")
+
+output.write_text("\n".join(body) + "\n")
+PY
+}
+
 record() {
   local name=$1 expected=$2 actual=$3
   if [[ "$actual" == "$expected" ]]; then
@@ -365,8 +386,69 @@ PY
   record "binary-name is passed through env" 'BINARY_NAME: ${{ inputs.binary-name }}' "$env_value"
 }
 
+run_checksum_case() {
+  local name=$1 fixture=$2 expected=$3
+  local repo="$TEST_ROOT/checksum-${name//[^a-zA-Z0-9]/-}"
+  local status=0 actual=success
+  mkdir -p "$repo/dist"
+
+  printf '%s\n' 'first asset' > "$repo/dist/first.tar.gz"
+  printf '%s\n' 'second asset' > "$repo/dist/second.zip"
+  case "$fixture" in
+    missing) ;;
+    tampered)
+      (cd "$repo/dist" && sha256sum first.tar.gz second.zip > checksums.txt)
+      printf '%s\n' 'tampered' >> "$repo/dist/first.tar.gz"
+      ;;
+    extra)
+      printf '%s\n' 'not published' > "$repo/dist/extra.tar.gz"
+      (cd "$repo/dist" && sha256sum first.tar.gz second.zip extra.tar.gz > checksums.txt)
+      rm "$repo/dist/extra.tar.gz"
+      ;;
+    correct)
+      (cd "$repo/dist" && sha256sum first.tar.gz second.zip > checksums.txt)
+      ;;
+    *)
+      printf 'unknown checksum fixture: %s\n' "$fixture" >&2
+      exit 1
+      ;;
+  esac
+
+  (cd "$repo" && bash "$TEST_ROOT/verify-checksums.sh") >"$repo/checksum.log" 2>&1 || status=$?
+  (( status == 0 )) || actual=failure
+  record "$name" "$expected" "$actual"
+}
+
+assert_attestation_is_fail_closed_and_ordered() {
+  local metadata order continue_on_error subject
+  metadata=$(python3 - "$WORKFLOW" <<'PY'
+from pathlib import Path
+import sys
+
+lines = Path(sys.argv[1]).read_text().splitlines()
+gate = next(i for i, line in enumerate(lines) if line == "      - name: Verify release checksums")
+attest = next(i for i, line in enumerate(lines) if line == "      - name: Generate SLSA attestation")
+end = next(
+    (i for i in range(attest + 1, len(lines)) if lines[i].startswith("      - name:")),
+    len(lines),
+)
+block = lines[attest:end]
+print("gate-before-attestation" if gate < attest else "invalid-order")
+print("present" if any(line.strip().startswith("continue-on-error:") for line in block) else "absent")
+print(next((line.strip() for line in block if line.strip().startswith("subject-path:")), "missing"))
+PY
+)
+  order=$(printf '%s\n' "$metadata" | sed -n '1p')
+  continue_on_error=$(printf '%s\n' "$metadata" | sed -n '2p')
+  subject=$(printf '%s\n' "$metadata" | sed -n '3p')
+  record "checksum gate runs before attestation" "gate-before-attestation" "$order"
+  record "attestation has no continue-on-error" "absent" "$continue_on_error"
+  record "attestation subject remains checksums.txt" "subject-path: 'dist/checksums.txt'" "$subject"
+}
+
 extract_release_script
 extract_smoke_script
+extract_checksum_script
 
 echo "=== Post-1.0 policy ==="
 run_case "breaking defaults to minor" v2.3.4 5 "" v2.4.0 true feat \
@@ -436,6 +518,14 @@ assert_smoke_outside_dist_fails
 assert_smoke_missing_manifest_fails
 assert_smoke_invalid_manifest_fails
 assert_empty_binary_name_preserves_static_skip
+
+echo ""
+echo "=== Go release checksum and attestation gate ==="
+run_checksum_case "missing checksum fails" missing failure
+run_checksum_case "tampered asset fails" tampered failure
+run_checksum_case "extra checksum fails" extra failure
+run_checksum_case "correct checksums pass" correct success
+assert_attestation_is_fail_closed_and_ordered
 
 echo ""
 printf 'Results: %d passed, %d failed\n' "$PASS" "$FAIL"

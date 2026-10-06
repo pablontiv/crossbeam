@@ -23,6 +23,7 @@ Shared CI/CD infrastructure for the [pablontiv](https://github.com/pablontiv) ec
 - [Core Idea](#core-idea)
 - [What's Inside](#whats-inside)
 - [Usage](#usage)
+- [Verify a Go release](#verify-a-go-release)
 - [AI-Native](#ai-native)
 - [Versioning](#versioning)
 - [Documentation](#documentation)
@@ -156,6 +157,19 @@ jobs:
       id-token: write
       attestations: write
 ```
+
+### Verify a Go release
+
+Download `checksums.txt` and all release assets, verify the attestation on the checksum manifest, and only then verify every asset from the download directory:
+
+```bash
+gh release download TAG --repo OWNER/CONSUMER --dir release
+cd release
+gh attestation verify checksums.txt --repo OWNER/CONSUMER --cert-identity 'https://github.com/pablontiv/crossbeam/.github/workflows/go-release.yml@refs/tags/v2'
+sha256sum --strict --check checksums.txt
+```
+
+The certificate identity names Crossbeam's reusable release workflow because it is the signer, while `OWNER/CONSUMER` is the repository that owns the release and attestation. The workflow fails closed if the checksum manifest is missing, empty, or does not verify. Because GoReleaser publishes before this post-publication gate, a later checksum or attestation failure fails the workflow but does not withdraw a release that is already published.
 
 ### Go PR candidate artifacts
 

@@ -262,8 +262,19 @@ jobs:
           fi
           "$ARTIFACT" version
 
+      - name: Verify release checksums
+        run: |
+          set -euo pipefail
+          if [[ ! -s dist/checksums.txt ]]; then
+            echo "::error::dist/checksums.txt is missing or empty"
+            exit 1
+          fi
+          (
+            cd dist
+            sha256sum --strict --check checksums.txt
+          )
+
       - name: Generate SLSA attestation
-        continue-on-error: true
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
         with:
           subject-path: 'dist/checksums.txt'
