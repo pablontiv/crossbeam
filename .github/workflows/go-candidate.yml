@@ -1,0 +1,1441 @@
+name: Go PR Candidate
+
+on:
+  workflow_call:
+    inputs:
+      source-repository:
+        description: 'Public fork repository containing the PR commit (owner/name)'
+        required: true
+        type: string
+      source-sha:
+        description: 'Exact 40-character PR commit SHA'
+        required: true
+        type: string
+      base-sha:
+        description: 'Exact 40-character caller base commit SHA'
+        required: true
+        type: string
+      pr-number:
+        description: 'Positive pull request number'
+        required: true
+        type: number
+      binary-name:
+        description: 'Binary expected in every archive'
+        required: true
+        type: string
+      go-version:
+        description: 'Exact trusted Go patch version, for example 1.24.1'
+        required: true
+        type: string
+      goreleaser-config:
+        description: 'GoReleaser config path read from the caller repository at base-sha'
+        required: false
+        type: string
+        default: '.goreleaser.yml'
+    outputs:
+      artifact-id:
+        description: 'Final validated artifact ID'
+        value: ${{ jobs.publish.outputs.artifact-id }}
+      artifact-digest:
+        description: 'Final validated artifact digest'
+        value: ${{ jobs.publish.outputs.artifact-digest }}
+      artifact-name:
+        description: 'Final validated artifact name'
+        value: ${{ jobs.publish.outputs.artifact-name }}
+      candidate-version:
+        description: 'Validated candidate version'
+        value: ${{ jobs.publish.outputs.candidate-version }}
+      source-sha:
+        description: 'Normalized candidate source SHA'
+        value: ${{ jobs.publish.outputs.source-sha }}
+
+permissions: {}
+
+jobs:
+  metadata:
+    name: Validate trusted metadata
+    runs-on: ubuntu-24.04
+    permissions:
+      pull-requests: read
+    outputs:
+      source-sha: ${{ steps.metadata.outputs.source_sha }}
+      base-sha: ${{ steps.metadata.outputs.base_sha }}
+      base-version: ${{ steps.metadata.outputs.base_version }}
+      candidate-version: ${{ steps.metadata.outputs.candidate_version }}
+      base-ref: ${{ steps.metadata.outputs.base_ref }}
+    steps:
+      - name: Validate PR and base graph
+        id: metadata
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          CALLER_REPOSITORY: ${{ github.repository }}
+          SOURCE_REPOSITORY: ${{ inputs.source-repository }}
+          SOURCE_SHA_INPUT: ${{ inputs.source-sha }}
+          BASE_SHA_INPUT: ${{ inputs.base-sha }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+          BINARY_NAME: ${{ inputs.binary-name }}
+          GO_VERSION: ${{ inputs.go-version }}
+          GORELEASER_CONFIG: ${{ inputs.goreleaser-config }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+
+          errors = []
+          repository = os.environ["SOURCE_REPOSITORY"]
+          repository_pattern = r"[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?/[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?"
+          if not re.fullmatch(repository_pattern, repository) or ".." in repository:
+              errors.append("source-repository must be an owner/name")
+          for name in ("SOURCE_SHA_INPUT", "BASE_SHA_INPUT"):
+              if not re.fullmatch(r"[0-9a-fA-F]{40}", os.environ[name]):
+                  errors.append(f"{name.lower().replace('_input', '').replace('_', '-')} must be 40 hexadecimal characters")
+          if not re.fullmatch(r"[1-9][0-9]*", os.environ["PR_NUMBER"]):
+              errors.append("pr-number must be a positive integer")
+          binary = os.environ["BINARY_NAME"]
+          windows_devices = {"CON", "PRN", "AUX", "NUL", *(f"COM{number}" for number in range(1, 10)), *(f"LPT{number}" for number in range(1, 10))}
+          if (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", binary)
+                  or binary.endswith((".", " ")) or binary.split(".", 1)[0].upper() in windows_devices
+                  or binary.casefold() in {"candidate.json", "artifacts.json", "metadata.json", "checksums.txt"}):
+              errors.append("binary-name must be a portable non-reserved basename")
+          if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", os.environ["GO_VERSION"]):
+              errors.append("go-version must be an exact patch version")
+          config = os.environ["GORELEASER_CONFIG"]
+          if (not re.fullmatch(r"[A-Za-z0-9._/-]+", config or "") or config.startswith(("/", "-"))
+                  or any(part in ("", ".", "..") for part in config.split("/"))):
+              errors.append("goreleaser-config must be a safe relative path")
+          if errors:
+              print("\n".join(f"::error::{error}" for error in errors))
+              sys.exit(1)
+          PY
+
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::error::GitHub token is unavailable for PR validation"
+            exit 1
+          fi
+          source_sha=${SOURCE_SHA_INPUT,,}
+          base_sha=${BASE_SHA_INPUT,,}
+          payload=$(curl --fail-with-body --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL%/}/repos/${CALLER_REPOSITORY}/pulls/${PR_NUMBER}")
+          api_values=$(PR_PAYLOAD="$payload" python3 - "$SOURCE_REPOSITORY" "$source_sha" "$base_sha" <<'PY'
+          import json
+          import os
+          import re
+          import sys
+
+          try:
+              pull = json.loads(os.environ["PR_PAYLOAD"])
+              head_repo = pull["head"]["repo"]["full_name"]
+              head_sha = pull["head"]["sha"].lower()
+              base_sha = pull["base"]["sha"].lower()
+              base_ref = pull["base"]["ref"]
+          except (AttributeError, KeyError, TypeError, json.JSONDecodeError) as error:
+              raise SystemExit(f"::error::Invalid pull request API payload: {error}")
+          if (head_repo, head_sha, base_sha) != tuple(sys.argv[1:4]):
+              raise SystemExit("::error::Pull request head repository/SHA or base SHA does not match inputs")
+          if not re.fullmatch(r"[A-Za-z0-9._/-]+", base_ref) or base_ref.startswith(("/", "-")) or ".." in base_ref:
+              raise SystemExit("::error::Unsafe PR base ref")
+          print(base_ref)
+          PY
+          )
+
+          graph=$(mktemp -d)
+          git -C "$graph" init
+          git -C "$graph" remote add base "https://github.com/${CALLER_REPOSITORY}.git"
+          git -C "$graph" fetch --no-tags base "+refs/heads/${api_values}:refs/remotes/base/pr-base"
+          branch_tip=$(git -C "$graph" rev-parse refs/remotes/base/pr-base)
+          if [[ "$branch_tip" != "$base_sha" ]]; then
+            echo "::error::PR base SHA is no longer the base branch tip; regenerate the candidate"
+            exit 1
+          fi
+          while read -r object ref; do
+            [[ -n "$object" ]] || continue
+            tag=${ref#refs/tags/}
+            if [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              git -C "$graph" fetch --no-tags base "$ref:$ref"
+            fi
+          done < <(git -C "$graph" ls-remote --tags --refs base 'refs/tags/v*')
+          base_version=$(git -C "$graph" tag --merged "$base_sha" -l 'v*' | sort -V | tail -n 1)
+          if [[ -z "$base_version" ]] || ! git -C "$graph" merge-base --is-ancestor "$base_version^{commit}" "$base_sha"; then
+            echo "::error::No trusted stable base tag is an ancestor of base-sha"
+            exit 1
+          fi
+          candidate_version=$(python3 - "$base_version" "$PR_NUMBER" "${source_sha:0:7}" <<'PY'
+          import re
+          import sys
+          match = re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", sys.argv[1])
+          if not match:
+              raise SystemExit("invalid base version")
+          major, minor, patch = map(int, match.groups())
+          print(f"{major}.{minor}.{patch + 1}-pr.{sys.argv[2]}.g{sys.argv[3]}")
+          PY
+          )
+          {
+            echo "source_sha=$source_sha"
+            echo "base_sha=$base_sha"
+            echo "base_version=$base_version"
+            echo "candidate_version=$candidate_version"
+            echo "base_ref=$api_values"
+          } >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build untrusted raw candidate
+    needs: metadata
+    runs-on: ubuntu-24.04
+    permissions: {}
+    outputs:
+      raw-artifact-id: ${{ steps.raw.outputs.artifact-id }}
+      raw-artifact-digest: ${{ steps.raw.outputs.artifact-digest }}
+    steps:
+      - name: Setup trusted Go toolchain
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v5.6.0
+        with:
+          go-version: ${{ inputs.go-version }}
+          cache: false
+          token: ''
+
+      - name: Verify local Go toolchain
+        env:
+          EXPECTED_GO_VERSION: ${{ inputs.go-version }}
+          GOTOOLCHAIN: local
+        run: |
+          actual=$(go env GOVERSION)
+          if [[ "$actual" != "go${EXPECTED_GO_VERSION}" ]]; then
+            echo "::error::Go toolchain $actual does not equal go${EXPECTED_GO_VERSION}"
+            exit 1
+          fi
+
+      - name: Install GoReleaser without running source
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94  # v6.3.0
+        with:
+          distribution: goreleaser
+          version: 'v2.18.2'
+          install-only: true
+
+      - name: Fetch exact public source and trusted config
+        env:
+          SOURCE_REPOSITORY: ${{ inputs.source-repository }}
+          SOURCE_SHA: ${{ needs.metadata.outputs.source-sha }}
+          BASE_REPOSITORY: ${{ github.repository }}
+          BASE_SHA: ${{ needs.metadata.outputs.base-sha }}
+          BASE_VERSION: ${{ needs.metadata.outputs.base-version }}
+          GORELEASER_CONFIG: ${{ inputs.goreleaser-config }}
+        run: |
+          git init source
+          git -C source remote add origin "https://github.com/${SOURCE_REPOSITORY}.git"
+          git -C source fetch --no-tags origin "$SOURCE_SHA"
+          git -C source checkout --detach "$SOURCE_SHA"
+          [[ "$(git -C source rev-parse HEAD)" == "$SOURCE_SHA" ]]
+
+          git -C source remote add base "https://github.com/${BASE_REPOSITORY}.git"
+          git -C source fetch --no-tags base "$BASE_SHA"
+          git -C source fetch --no-tags base "refs/tags/${BASE_VERSION}:refs/tags/${BASE_VERSION}"
+          if ! git -C source merge-base --is-ancestor "$BASE_SHA" "$SOURCE_SHA"; then
+            echo "::error::base-sha must be an ancestor of source-sha; rebase and regenerate"
+            exit 1
+          fi
+          if ! git -C source merge-base --is-ancestor "$BASE_VERSION^{commit}" "$BASE_SHA"; then
+            echo "::error::trusted base version is not an ancestor of base-sha"
+            exit 1
+          fi
+
+          mode=$(git -C source ls-tree "$BASE_SHA" -- "$GORELEASER_CONFIG" | awk 'NR == 1 {print $1}')
+          if [[ "$mode" != "100644" && "$mode" != "100755" ]]; then
+            echo "::error::GoReleaser config at base-sha must be a regular blob"
+            exit 1
+          fi
+          trusted_config="$RUNNER_TEMP/trusted-goreleaser.yml"
+          git -C source show "${BASE_SHA}:${GORELEASER_CONFIG}" > "$trusted_config"
+          printf '%s\n' "$trusted_config" > "$RUNNER_TEMP/trusted-config-path"
+
+      - name: Snapshot source workspace before build
+        env:
+          SNAPSHOT_PATH: ${{ runner.temp }}/source-snapshot-before.json
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import stat
+
+          root = Path("source")
+          entries = []
+
+          def visit(directory, relative=Path()):
+              for entry in sorted(os.scandir(directory), key=lambda item: item.name):
+                  child = relative / entry.name
+                  if child.parts[0] in (".git", "dist"):
+                      continue
+                  info = entry.stat(follow_symlinks=False)
+                  mode = stat.S_IMODE(info.st_mode)
+                  if stat.S_ISLNK(info.st_mode):
+                      entries.append({"path": child.as_posix(), "type": "symlink", "mode": mode, "target": os.readlink(entry.path)})
+                  elif stat.S_ISDIR(info.st_mode):
+                      entries.append({"path": child.as_posix(), "type": "directory", "mode": mode})
+                      visit(entry.path, child)
+                  elif stat.S_ISREG(info.st_mode):
+                      digest = hashlib.sha256()
+                      with open(entry.path, "rb") as stream:
+                          for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                              digest.update(chunk)
+                      entries.append({"path": child.as_posix(), "type": "file", "mode": mode, "sha256": digest.hexdigest()})
+                  else:
+                      entries.append({"path": child.as_posix(), "type": "special", "mode": mode})
+
+          visit(root)
+          Path(os.environ["SNAPSHOT_PATH"]).write_text(json.dumps(entries, separators=(",", ":"), sort_keys=True) + "\n")
+          PY
+
+      - name: Build candidate with sanitized environment
+        env:
+          PR_NUMBER: ${{ inputs.pr-number }}
+        run: |
+          trusted_config=$(cat "$RUNNER_TEMP/trusted-config-path")
+          cd source
+          env -i \
+            HOME="$HOME" \
+            PATH="$PATH" \
+            TMPDIR="$RUNNER_TEMP" \
+            GOTOOLCHAIN=local \
+            PR_NUMBER="$PR_NUMBER" \
+            goreleaser release --snapshot --clean --config "$trusted_config"
+
+      - name: Verify source workspace after build
+        env:
+          SOURCE_SHA: ${{ needs.metadata.outputs.source-sha }}
+          SNAPSHOT_PATH: ${{ runner.temp }}/source-snapshot-before.json
+        run: |
+          if [[ "$(git -C source rev-parse HEAD)" != "$SOURCE_SHA" ]]; then
+            echo "::error::source HEAD changed during GoReleaser"
+            exit 1
+          fi
+          source_status=$(git -C source status --porcelain --untracked-files=all)
+          if [[ -n "$source_status" ]]; then
+            echo "::error::source checkout was modified by build or hooks"
+            printf '%s\n' "$source_status"
+            exit 1
+          fi
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import stat
+
+          root = Path("source")
+          entries = []
+
+          def visit(directory, relative=Path()):
+              for entry in sorted(os.scandir(directory), key=lambda item: item.name):
+                  child = relative / entry.name
+                  if child.parts[0] in (".git", "dist"):
+                      continue
+                  info = entry.stat(follow_symlinks=False)
+                  mode = stat.S_IMODE(info.st_mode)
+                  if stat.S_ISLNK(info.st_mode):
+                      entries.append({"path": child.as_posix(), "type": "symlink", "mode": mode, "target": os.readlink(entry.path)})
+                  elif stat.S_ISDIR(info.st_mode):
+                      entries.append({"path": child.as_posix(), "type": "directory", "mode": mode})
+                      visit(entry.path, child)
+                  elif stat.S_ISREG(info.st_mode):
+                      digest = hashlib.sha256()
+                      with open(entry.path, "rb") as stream:
+                          for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                              digest.update(chunk)
+                      entries.append({"path": child.as_posix(), "type": "file", "mode": mode, "sha256": digest.hexdigest()})
+                  else:
+                      entries.append({"path": child.as_posix(), "type": "special", "mode": mode})
+
+          visit(root)
+          before = json.loads(Path(os.environ["SNAPSHOT_PATH"]).read_text())
+          if entries != before:
+              raise SystemExit("::error::source workspace changed outside designated dist directory")
+          PY
+
+      - name: Bound and stage raw dist
+        env:
+          RAW_ROOT: ${{ runner.temp }}/candidate-raw
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path, PurePosixPath
+          import re
+          import shutil
+          import stat
+
+          workspace = Path.cwd().resolve()
+          dist = (workspace / "source/dist").resolve(strict=True)
+          if dist.is_symlink() or not dist.is_dir():
+              raise SystemExit("::error::dist must be a real directory")
+
+          windows_devices = {"CON", "PRN", "AUX", "NUL", *(f"COM{number}" for number in range(1, 10)), *(f"LPT{number}" for number in range(1, 10))}
+
+          def portable_basename(value):
+              if (not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value)
+                      or value.endswith((".", " ")) or value.split(".", 1)[0].upper() in windows_devices):
+                  raise SystemExit("::error::artifact basename is not portable")
+              return value
+
+          def safe_file(raw, maximum):
+              if not isinstance(raw, str) or not raw or Path(raw).is_absolute() or "\\" in raw:
+                  raise SystemExit("::error::unsafe dist path")
+              basename = portable_basename(raw.removeprefix("dist/"))
+              if raw != f"dist/{basename}":
+                  raise SystemExit("::error::declared path must be literal dist/basename")
+              path = workspace / "source" / raw
+              try:
+                  path.relative_to(dist)
+              except ValueError:
+                  raise SystemExit("::error::dist path escapes")
+              parts = PurePosixPath(raw).parts
+              if "/".join(parts) != raw or any(part in ("", ".", "..") or part.startswith(".") for part in parts):
+                  raise SystemExit("::error::hidden, traversing, or noncanonical dist path")
+              if any(parent.is_symlink() for parent in [path, *path.parents] if parent != workspace.parent):
+                  raise SystemExit("::error::dist path contains symlink")
+              resolved = path.resolve(strict=True)
+              resolved.relative_to(dist)
+              if not stat.S_ISREG(resolved.stat(follow_symlinks=False).st_mode):
+                  raise SystemExit("::error::dist path is not regular")
+              if resolved.stat().st_size > maximum:
+                  raise SystemExit("::error::dist path exceeds pre-upload size limit")
+              return resolved
+
+          artifacts_path = safe_file("dist/artifacts.json", 4 * 1024 * 1024)
+          metadata_path = safe_file("dist/metadata.json", 4 * 1024 * 1024)
+          artifacts = json.loads(artifacts_path.read_text())
+          if not isinstance(artifacts, list) or not all(isinstance(item, dict) for item in artifacts):
+              raise SystemExit("::error::invalid artifacts.json")
+          selected = [item for item in artifacts if item.get("type") in ("Archive", "Checksum")]
+          archives = [item for item in selected if item.get("type") == "Archive"]
+          checksums = [item for item in selected if item.get("type") == "Checksum"]
+          expected_matrix = {
+              ("linux", "amd64"), ("linux", "arm64"),
+              ("darwin", "amd64"), ("darwin", "arm64"),
+              ("windows", "amd64"), ("windows", "arm64"),
+          }
+          matrix = {(item.get("goos"), item.get("goarch")) for item in archives}
+          if len(archives) != 6 or matrix != expected_matrix or len(checksums) != 1:
+              raise SystemExit("::error::raw artifact inventory is not the six-target matrix")
+          selected_files = [
+              safe_file(item.get("path"), 4 * 1024 * 1024 if item.get("type") == "Checksum" else 256 * 1024 * 1024)
+              for item in selected
+          ]
+          declared_names = [portable_basename(path.name) for path in selected_files]
+          reserved = {"candidate.json", "artifacts.json", "metadata.json"}
+          collision_keys = {name.rstrip(" .").casefold() for name in declared_names}
+          if (checksum_path := checksums[0].get("path")) != "dist/checksums.txt":
+              raise SystemExit("::error::checksum path must be exactly dist/checksums.txt")
+          if (len(declared_names) != 7 or len(collision_keys) != len(declared_names)
+                  or collision_keys & reserved):
+              raise SystemExit("::error::declared archive/checksum basenames collide or are reserved")
+          files = [artifacts_path, metadata_path, *selected_files]
+          if len(files) != 9 or len({path.name.casefold() for path in files}) != len(files):
+              raise SystemExit("::error::raw basenames or cardinality are invalid")
+          total = sum(path.stat().st_size for path in files)
+          if total > 1024 * 1024 * 1024 or any(path.stat().st_size > 256 * 1024 * 1024 for path in files):
+              raise SystemExit("::error::raw artifact size limit exceeded")
+          target = Path(os.environ["RAW_ROOT"])
+          if target.exists():
+              shutil.rmtree(target)
+          target_dist = target / "dist"
+          target_dist.mkdir(parents=True)
+          for path in sorted(files, key=lambda item: item.name):
+              shutil.copy2(path, target_dist / path.name)
+          expected_staged = sorted(path.name for path in files)
+          actual_staged = sorted(path.name for path in target_dist.iterdir())
+          if len(actual_staged) != 9 or actual_staged != expected_staged or any(
+                  path.is_symlink() or not path.is_file() for path in target_dist.iterdir()):
+              raise SystemExit("::error::raw staging inventory or cardinality mismatch")
+          PY
+
+      - name: Upload raw candidate dist
+        id: raw
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: go-candidate-raw-pr-${{ inputs.pr-number }}-${{ needs.metadata.outputs.source-sha }}
+          path: ${{ runner.temp }}/candidate-raw/
+          compression-level: 0
+          include-hidden-files: true
+          retention-days: 1
+          overwrite: false
+          if-no-files-found: error
+
+  static-validate:
+    name: Validate raw candidate without execution
+    needs: [metadata, build]
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - name: Setup trusted Go inspector
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v5.6.0
+        with:
+          go-version: ${{ inputs.go-version }}
+          cache: false
+          token: ''
+
+      - name: Download exact raw artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          artifact-ids: ${{ needs.build.outputs.raw-artifact-id }}
+          path: raw
+          merge-multiple: true
+
+      - name: Validate raw candidate statically
+        env:
+          SOURCE_SHA: ${{ needs.metadata.outputs.source-sha }}
+          CANDIDATE_VERSION: ${{ needs.metadata.outputs.candidate-version }}
+          BINARY_NAME: ${{ inputs.binary-name }}
+          GO_VERSION: ${{ inputs.go-version }}
+        run: |
+          python3 - <<'PY'
+          import gzip
+          import hashlib
+          import json
+          import os
+          from pathlib import Path, PurePosixPath
+          import re
+          import resource
+          import stat
+          import struct
+          import subprocess
+          import sys
+          import tempfile
+          import unicodedata
+          import zipfile
+
+          root = Path("raw").resolve()
+          dist = root / "dist"
+          if dist.is_symlink() or not dist.is_dir():
+              raise SystemExit("::error::raw dist must be a real directory")
+          MAX_ENTRIES = 128
+          MAX_MEMBER = 256 * 1024 * 1024
+          MAX_ARCHIVE = 256 * 1024 * 1024
+          MAX_EXPANDED = 512 * 1024 * 1024
+          MAX_RATIO = 200
+          MAX_CONTROL = 4 * 1024 * 1024
+          MAX_DOCUMENT = 4 * 1024 * 1024
+          EXPECTED_MATRIX = {
+              ("linux", "amd64"), ("linux", "arm64"),
+              ("darwin", "amd64"), ("darwin", "arm64"),
+              ("windows", "amd64"), ("windows", "arm64"),
+          }
+          if sys.platform.startswith("linux"):
+              for limit, soft in (
+                  (resource.RLIMIT_CPU, 180),
+                  (resource.RLIMIT_FSIZE, 1024 * 1024 * 1024),
+                  (resource.RLIMIT_NOFILE, 256),
+              ):
+                  current_soft, current_hard = resource.getrlimit(limit)
+                  bounded = soft if current_hard == resource.RLIM_INFINITY else min(soft, current_hard)
+                  resource.setrlimit(limit, (bounded, current_hard))
+
+          def regular(path, maximum=None):
+              if path.is_symlink() or not path.is_file() or not stat.S_ISREG(path.stat(follow_symlinks=False).st_mode):
+                  raise SystemExit(f"::error::not a regular raw file: {path}")
+              if maximum is not None and path.stat().st_size > maximum:
+                  raise SystemExit(f"::error::raw file exceeds size limit: {path}")
+              return path
+
+          artifacts_path = regular(dist / "artifacts.json", MAX_CONTROL)
+          metadata_path = regular(dist / "metadata.json", MAX_CONTROL)
+          artifacts = json.loads(artifacts_path.read_text())
+          if not isinstance(artifacts, list) or not all(isinstance(item, dict) for item in artifacts):
+              raise SystemExit("::error::artifacts.json must use GoReleaser's direct-list shape")
+          archives = [item for item in artifacts if item.get("type") == "Archive"]
+          checksum_items = [item for item in artifacts if item.get("type") == "Checksum"]
+          if len(archives) != len(EXPECTED_MATRIX) or len(checksum_items) != 1:
+              raise SystemExit("::error::invalid six-target archive/checksum inventory")
+
+          windows_devices = {"CON", "PRN", "AUX", "NUL", *(f"COM{number}" for number in range(1, 10)), *(f"LPT{number}" for number in range(1, 10))}
+
+          def portable_basename(value):
+              if (not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value)
+                      or value.endswith((".", " ")) or value.split(".", 1)[0].upper() in windows_devices):
+                  raise SystemExit("::error::artifact basename is not portable")
+              return value
+
+          def raw_path(item, maximum):
+              raw = item.get("path")
+              if not isinstance(raw, str) or Path(raw).is_absolute() or "\\" in raw:
+                  raise SystemExit("::error::unsafe artifact path")
+              basename = portable_basename(raw.removeprefix("dist/"))
+              if raw != f"dist/{basename}":
+                  raise SystemExit("::error::artifact path must be literal dist/basename")
+              parts = PurePosixPath(raw).parts
+              if len(parts) != 2 or parts[0] != "dist" or "/".join(parts) != raw or any(
+                      part in ("", ".", "..") or part.startswith(".") for part in parts):
+                  raise SystemExit("::error::artifact path must be canonical dist/non-hidden-basename")
+              return regular(root / Path(*parts), maximum)
+
+          archive_paths = [(item, raw_path(item, MAX_ARCHIVE)) for item in archives]
+          checksum_path = raw_path(checksum_items[0], MAX_CONTROL)
+          declared_names = [portable_basename(path.name) for _, path in archive_paths] + [portable_basename(checksum_path.name)]
+          reserved = {"candidate.json", "artifacts.json", "metadata.json"}
+          collision_keys = {name.rstrip(" .").casefold() for name in declared_names}
+          if checksum_items[0].get("path") != "dist/checksums.txt":
+              raise SystemExit("::error::checksum path must be exactly dist/checksums.txt")
+          if (len(declared_names) != 7 or len(collision_keys) != len(declared_names)
+                  or collision_keys & reserved):
+              raise SystemExit("::error::declared raw basenames collide or are reserved")
+          expected_files = ["artifacts.json", "metadata.json", *declared_names]
+          actual_entries = list(dist.iterdir())
+          actual_files = [path.name for path in actual_entries]
+          if (len(expected_files) != 9 or len(actual_files) != 9 or sorted(actual_files) != sorted(expected_files)
+                  or any(path.is_symlink() or not path.is_file() for path in actual_entries)):
+              raise SystemExit("::error::raw dist inventory and cardinality do not exactly match declarations")
+
+          checksums = {}
+          for line in checksum_path.read_text().splitlines():
+              match = re.fullmatch(r"([0-9a-fA-F]{64})  ([A-Za-z0-9][A-Za-z0-9._-]*)", line)
+              if not match or match.group(2).startswith(".") or match.group(2) in checksums:
+                  raise SystemExit("::error::invalid or duplicate checksum")
+              checksums[match.group(2)] = match.group(1).lower()
+          archive_names = [path.name for _, path in archive_paths]
+          if len(archive_names) != 6 or len({name.casefold() for name in archive_names}) != 6:
+              raise SystemExit("::error::declared archive paths are duplicated")
+          if len(checksums) != 6 or set(checksums) != set(archive_names):
+              raise SystemExit("::error::checksums do not map one-to-one to archives")
+
+          metadata = json.loads(metadata_path.read_text())
+          if metadata.get("version") != os.environ["CANDIDATE_VERSION"] or "dev" in metadata.get("version", "").lower():
+              raise SystemExit("::error::candidate metadata version mismatch")
+          if str(metadata.get("commit", "")).lower() != os.environ["SOURCE_SHA"]:
+              raise SystemExit("::error::candidate metadata commit mismatch")
+
+          def stream_sha256(path):
+              digest = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          def safe_member_name(name):
+              if not name or name.startswith("/") or "\\" in name or any(ord(char) < 32 or ord(char) > 126 for char in name):
+                  raise SystemExit("::error::archive member path must be relative printable ASCII")
+              parts = PurePosixPath(name).parts
+              if "/".join(parts) != name or any(part in ("", ".", "..") or part.startswith(".") for part in parts):
+                  raise SystemExit("::error::archive member path is noncanonical, hidden, traversing, or unsafe")
+              for part in parts:
+                  portable_basename(part)
+              return parts
+
+          def validate_document_path(parts):
+              root_document = len(parts) == 1 and re.fullmatch(
+                  r"(LICENSE|README|CHANGELOG|NOTICE)(\.md|\.txt)?", parts[0])
+              nested_markdown = len(parts) >= 2 and parts[0] == "docs" and parts[-1].endswith(".md")
+              if not root_document and not nested_markdown:
+                  raise SystemExit("::error::non-binary archive member is not an allowed documentation path")
+
+          def validate_document_payload(data):
+              if len(data) > MAX_DOCUMENT:
+                  raise SystemExit("::error::documentation payload exceeds size limit")
+              try:
+                  text = data.decode("utf-8-sig")
+              except UnicodeDecodeError:
+                  raise SystemExit("::error::documentation payload is not UTF-8")
+              for char in text:
+                  category = unicodedata.category(char)
+                  if category == "Cc" and char not in "\t\n\r":
+                      raise SystemExit("::error::documentation payload contains a Unicode control character")
+                  if category == "Cf" and char not in ("\u200c", "\u200d"):
+                      raise SystemExit("::error::documentation payload contains a disallowed Unicode format character")
+
+          def validate_members(records, archive_size, expected_binary):
+              if not 1 <= len(records) <= MAX_ENTRIES:
+                  raise SystemExit("::error::archive entry limit exceeded")
+              seen = set()
+              expanded = 0
+              binary_key = None
+              binary_size = None
+              binary_aliases = {os.environ["BINARY_NAME"], f"{os.environ['BINARY_NAME']}.exe"}
+              for name, size, compressed, mode, key in records:
+                  parts = safe_member_name(name)
+                  folded = "/".join(part.rstrip(" .").casefold() for part in parts)
+                  if folded in seen:
+                      raise SystemExit("::error::duplicate or casefold-colliding archive member")
+                  seen.add(folded)
+                  if size < 0 or size > MAX_MEMBER:
+                      raise SystemExit("::error::archive member size limit exceeded")
+                  expanded += size
+                  if compressed is not None and ((size and compressed <= 0) or (compressed > 0 and size > compressed * MAX_RATIO)):
+                      raise SystemExit("::error::archive member compression ratio limit exceeded")
+                  permissions = mode & 0o7777
+                  is_binary = parts[-1] in binary_aliases
+                  if permissions & 0o7022:
+                      raise SystemExit("::error::archive member has unsafe mode")
+                  if is_binary:
+                      if len(parts) != 1 or name != expected_binary or binary_key is not None:
+                          raise SystemExit("::error::binary name, platform extension, root path, or uniqueness mismatch")
+                      if not permissions & 0o111:
+                          raise SystemExit("::error::binary is not executable")
+                      binary_key = key
+                      binary_size = size
+                  else:
+                      if permissions & 0o111:
+                          raise SystemExit("::error::documentation member must not be executable")
+                      validate_document_path(parts)
+                      if size > MAX_DOCUMENT:
+                          raise SystemExit("::error::documentation member exceeds size limit before payload read")
+              if expanded > MAX_EXPANDED or expanded > max(archive_size, 1) * MAX_RATIO:
+                  raise SystemExit("::error::archive expanded size or ratio limit exceeded")
+              if binary_key is None:
+                  raise SystemExit("::error::archive lacks its exact root platform binary")
+              return binary_key, binary_size
+
+          def read_member_bounded(stream, expected_size, capture):
+              chunks = []
+              total = 0
+              while total < expected_size:
+                  chunk = stream.read(min(1024 * 1024, expected_size - total))
+                  if not chunk:
+                      raise SystemExit("::error::archive member payload is truncated")
+                  if capture:
+                      chunks.append(chunk)
+                  total += len(chunk)
+              if stream.read(1):
+                  raise SystemExit("::error::archive member exceeds declared size")
+              return b"".join(chunks) if capture else None
+
+          def preflight_zip(path):
+              size = path.stat().st_size
+              tail_size = min(size, 22 + 65535)
+              with path.open("rb") as stream:
+                  stream.seek(size - tail_size)
+                  tail = stream.read(tail_size)
+              marker = tail.rfind(b"PK\x05\x06")
+              if marker < 0 or marker + 22 > len(tail):
+                  raise SystemExit("::error::ZIP preflight cannot find EOCD")
+              eocd_offset = size - tail_size + marker
+              fields = struct.unpack_from("<4s4H2LH", tail, marker)
+              _, disk, cd_disk, disk_entries, entries, cd_size, cd_offset, comment_size = fields
+              if marker + 22 + comment_size != len(tail):
+                  raise SystemExit("::error::ZIP preflight rejects trailing or malformed EOCD data")
+              if disk or cd_disk or disk_entries != entries:
+                  raise SystemExit("::error::ZIP preflight rejects multi-disk archives")
+              if entries == 0xFFFF or cd_size == 0xFFFFFFFF or cd_offset == 0xFFFFFFFF:
+                  raise SystemExit("::error::ZIP preflight rejects ZIP64 sentinels")
+              if not 1 <= entries <= MAX_ENTRIES:
+                  raise SystemExit("::error::ZIP preflight entry count exceeds limit")
+              if cd_size > MAX_CONTROL:
+                  raise SystemExit("::error::ZIP preflight central directory exceeds limit")
+              if cd_offset > eocd_offset or cd_size > eocd_offset - cd_offset or cd_offset + cd_size != eocd_offset:
+                  raise SystemExit("::error::ZIP preflight central directory offset or size is invalid")
+              return entries
+
+          def local_zip_name(path, info):
+              with path.open("rb") as stream:
+                  if info.header_offset < 0 or info.header_offset + 30 > path.stat().st_size:
+                      raise SystemExit("::error::ZIP local header offset is invalid")
+                  stream.seek(info.header_offset)
+                  fixed = stream.read(30)
+                  if len(fixed) != 30 or fixed[:4] != b"PK\x03\x04":
+                      raise SystemExit("::error::ZIP local header signature is invalid")
+                  name_size, extra_size = struct.unpack_from("<HH", fixed, 26)
+                  if name_size > 4096 or extra_size > MAX_CONTROL:
+                      raise SystemExit("::error::ZIP local header fields exceed limits")
+                  raw_name = stream.read(name_size)
+                  if len(raw_name) != name_size:
+                      raise SystemExit("::error::ZIP local header filename is truncated")
+              encoding = "utf-8" if info.flag_bits & 0x800 else "cp437"
+              try:
+                  expected = info.filename.encode(encoding)
+              except UnicodeEncodeError:
+                  raise SystemExit("::error::ZIP central filename encoding is unsafe")
+              if raw_name != expected:
+                  raise SystemExit("::error::ZIP local and central filenames differ")
+
+          def parse_tar_octal(field, label):
+              if field and field[0] & 0x80:
+                  raise SystemExit(f"::error::TAR {label} uses unsupported base-256 encoding")
+              value = field.rstrip(b"\x00 ").lstrip(b" ")
+              if not value or any(byte not in b"01234567" for byte in value):
+                  raise SystemExit(f"::error::TAR {label} is not canonical octal")
+              return int(value, 8)
+
+          def parse_tar_name(field):
+              value, separator, remainder = field.partition(b"\x00")
+              if separator and any(remainder):
+                  raise SystemExit("::error::TAR name field has nonzero padding")
+              try:
+                  return value.decode("ascii")
+              except UnicodeDecodeError:
+                  raise SystemExit("::error::TAR name is not ASCII")
+
+          def scan_tar_gz(path, expected_binary):
+              archive_size = path.stat().st_size
+              streamed = 0
+              expanded = 0
+              count = 0
+              seen = set()
+              binary_data = None
+              binary_aliases = {os.environ["BINARY_NAME"], f"{os.environ['BINARY_NAME']}.exe"}
+
+              def read_exact(stream, size, capture=True):
+                  nonlocal streamed
+                  chunks = []
+                  remaining = size
+                  while remaining:
+                      chunk = stream.read(min(1024 * 1024, remaining))
+                      if not chunk:
+                          raise SystemExit("::error::TAR.GZ payload is truncated")
+                      if capture:
+                          chunks.append(chunk)
+                      streamed += len(chunk)
+                      if streamed > MAX_EXPANDED + MAX_ENTRIES * 1024 + 1024 * 1024:
+                          raise SystemExit("::error::TAR.GZ stream exceeds global limit")
+                      remaining -= len(chunk)
+                  return b"".join(chunks) if capture else None
+
+              with path.open("rb") as compressed:
+                  if compressed.read(2) != b"\x1f\x8b":
+                      raise SystemExit("::error::Unix archive must be GZIP-compressed TAR")
+                  compressed.seek(0)
+                  with gzip.GzipFile(fileobj=compressed) as stream:
+                      while True:
+                          header = read_exact(stream, 512)
+                          if header == b"\x00" * 512:
+                              while True:
+                                  chunk = stream.read(1024 * 1024)
+                                  if not chunk:
+                                      break
+                                  streamed += len(chunk)
+                                  if any(chunk) or streamed > MAX_EXPANDED + MAX_ENTRIES * 1024 + 1024 * 1024:
+                                      raise SystemExit("::error::TAR.GZ has nonzero or excessive trailing data")
+                              break
+                          count += 1
+                          if count > MAX_ENTRIES:
+                              raise SystemExit("::error::TAR entry count exceeds limit before payload read")
+                          if header[257:263] != b"ustar\x00":
+                              raise SystemExit("::error::TAR header is not simple USTAR")
+                          stored_checksum = parse_tar_octal(header[148:156], "checksum")
+                          checksum_header = header[:148] + b" " * 8 + header[156:]
+                          if sum(checksum_header) != stored_checksum:
+                              raise SystemExit("::error::TAR header checksum mismatch")
+                          typeflag = header[156:157]
+                          if typeflag not in (b"\x00", b"0"):
+                              raise SystemExit("::error::TAR rejects PAX, GNU longname, directory, link, device, FIFO, or special member")
+                          name = parse_tar_name(header[:100])
+                          prefix = parse_tar_name(header[345:500])
+                          if prefix:
+                              name = f"{prefix}/{name}"
+                          parts = safe_member_name(name)
+                          folded = "/".join(part.rstrip(" .").casefold() for part in parts)
+                          if folded in seen:
+                              raise SystemExit("::error::duplicate or casefold-colliding TAR member")
+                          seen.add(folded)
+                          size = parse_tar_octal(header[124:136], "size")
+                          mode = parse_tar_octal(header[100:108], "mode")
+                          if size > MAX_MEMBER:
+                              raise SystemExit("::error::TAR member size exceeds limit before payload read")
+                          expanded += size
+                          if expanded > MAX_EXPANDED or expanded > max(archive_size, 1) * MAX_RATIO:
+                              raise SystemExit("::error::TAR expanded size or ratio exceeds limit before payload read")
+                          permissions = mode & 0o7777
+                          is_binary = parts[-1] in binary_aliases
+                          if permissions & 0o7022:
+                              raise SystemExit("::error::TAR member has unsafe mode")
+                          if is_binary:
+                              if len(parts) != 1 or name != expected_binary or binary_data is not None or not permissions & 0o111:
+                                  raise SystemExit("::error::TAR binary name, root path, uniqueness, or mode mismatch")
+                          else:
+                              if permissions & 0o111:
+                                  raise SystemExit("::error::TAR documentation member must not be executable")
+                              validate_document_path(parts)
+                              if size > MAX_DOCUMENT:
+                                  raise SystemExit("::error::TAR documentation exceeds size limit before payload read")
+                          payload = read_exact(stream, size, capture=True)
+                          if is_binary:
+                              binary_data = payload
+                          else:
+                              validate_document_payload(payload)
+                          padding = (-size) % 512
+                          if padding:
+                              read_exact(stream, padding, capture=False)
+              if count == 0 or binary_data is None:
+                  raise SystemExit("::error::TAR lacks its exact root platform binary")
+              return binary_data
+
+          def validate_executable_header(data, platform):
+              goos, goarch = platform
+              if goos == "linux":
+                  if len(data) < 20 or data[:4] != b"\x7fELF" or data[4] != 2 or data[5] != 1:
+                      raise SystemExit("::error::Linux binary must be little-endian ELF64")
+                  machine = struct.unpack_from("<H", data, 18)[0]
+                  expected = {"amd64": 62, "arm64": 183}[goarch]
+              elif goos == "darwin":
+                  if len(data) < 8 or data[:4] not in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf"):
+                      raise SystemExit("::error::Darwin binary lacks a valid 64-bit Mach-O header")
+                  endian = "<" if data[:4] == b"\xcf\xfa\xed\xfe" else ">"
+                  machine = struct.unpack_from(f"{endian}I", data, 4)[0]
+                  expected = {"amd64": 0x01000007, "arm64": 0x0100000C}[goarch]
+              else:
+                  if len(data) < 64 or data[:2] != b"MZ":
+                      raise SystemExit("::error::Windows binary lacks a valid PE header")
+                  pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+                  if pe_offset + 26 > len(data) or data[pe_offset:pe_offset + 4] != b"PE\x00\x00":
+                      raise SystemExit("::error::Windows binary has an invalid PE offset")
+                  machine = struct.unpack_from("<H", data, pe_offset + 4)[0]
+                  optional_magic = struct.unpack_from("<H", data, pe_offset + 24)[0]
+                  if optional_magic != 0x20B:
+                      raise SystemExit("::error::Windows binary is not PE32+")
+                  expected = {"amd64": 0x8664, "arm64": 0xAA64}[goarch]
+              if machine != expected:
+                  raise SystemExit("::error::executable header does not match declared platform architecture")
+
+          matrix = set()
+          for item, archive in sorted(archive_paths, key=lambda pair: pair[1].name):
+              if stream_sha256(archive) != checksums[archive.name]:
+                  raise SystemExit("::error::archive checksum mismatch")
+              platform = (item.get("goos"), item.get("goarch"))
+              if platform not in EXPECTED_MATRIX or platform in matrix:
+                  raise SystemExit("::error::invalid or duplicate six-target platform matrix entry")
+              matrix.add(platform)
+              expected_binary = f"{os.environ['BINARY_NAME']}.exe" if platform[0] == "windows" else os.environ["BINARY_NAME"]
+              archive_size = archive.stat().st_size
+              binary_data = None
+              if platform[0] == "windows":
+                  expected_entries = preflight_zip(archive)
+                  with zipfile.ZipFile(archive) as bundle:
+                      infos = bundle.infolist()
+                      if len(infos) != expected_entries:
+                          raise SystemExit("::error::ZIP central directory count differs from EOCD preflight")
+                      records = []
+                      for index, info in enumerate(infos):
+                          mode = info.external_attr >> 16
+                          file_type = stat.S_IFMT(mode)
+                          if info.is_dir() or file_type not in (0, stat.S_IFREG) or info.flag_bits & 1:
+                              raise SystemExit("::error::zip contains directory, link, special, or encrypted member")
+                          records.append((info.filename, info.file_size, info.compress_size, mode, index))
+                      binary_index, binary_size = validate_members(records, archive_size, expected_binary)
+                      for index, info in enumerate(infos):
+                          local_zip_name(archive, info)
+                          with bundle.open(info) as stream:
+                              payload = read_member_bounded(stream, info.file_size, capture=True)
+                          if index == binary_index:
+                              binary_data = payload
+                          else:
+                              validate_document_payload(payload)
+                      if len(binary_data) != binary_size:
+                          raise SystemExit("::error::ZIP binary size differs from validated metadata")
+              else:
+                  binary_data = scan_tar_gz(archive, expected_binary)
+                  binary_size = len(binary_data)
+              if len(binary_data) != binary_size:
+                  raise SystemExit("::error::binary payload size differs from bounded metadata")
+              validate_executable_header(binary_data, platform)
+              with tempfile.NamedTemporaryFile() as binary:
+                  binary.write(binary_data)
+                  binary.flush()
+                  result = subprocess.run(["go", "version", "-m", binary.name], check=True, text=True, capture_output=True)
+              compiler = re.search(r":\s+(go[0-9]+\.[0-9]+\.[0-9]+)\s*$", result.stdout.splitlines()[0])
+              if not compiler or compiler.group(1) != f"go{os.environ['GO_VERSION']}":
+                  raise SystemExit("::error::binary Go compiler version is not an exact match")
+              revisions = re.findall(r"(?m)^\s*build\s+vcs\.revision=(\S+)\s*$", result.stdout)
+              modified = re.findall(r"(?m)^\s*build\s+vcs\.modified=(\S+)\s*$", result.stdout)
+              build_goos = re.findall(r"(?m)^\s*build\s+GOOS=(\S+)\s*$", result.stdout)
+              build_goarch = re.findall(r"(?m)^\s*build\s+GOARCH=(\S+)\s*$", result.stdout)
+              if revisions != [os.environ["SOURCE_SHA"]] or modified != ["false"]:
+                  raise SystemExit("::error::binary VCS revision or modified state mismatch")
+              if build_goos != [platform[0]] or build_goarch != [platform[1]]:
+                  raise SystemExit("::error::binary build settings do not match declared GOOS/GOARCH")
+          if matrix != EXPECTED_MATRIX:
+              raise SystemExit("::error::declared archives do not form the required six-target matrix")
+          PY
+
+  smoke:
+    name: Isolated linux amd64 smoke
+    needs: [metadata, build, static-validate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions: {}
+    steps:
+      - name: Download exact raw artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          artifact-ids: ${{ needs.build.outputs.raw-artifact-id }}
+          path: raw
+          merge-multiple: true
+
+      - name: Extract only validated smoke binary
+        id: extract
+        env:
+          BINARY_NAME: ${{ inputs.binary-name }}
+        run: |
+          python3 - <<'PY'
+          import gzip
+          import json
+          import os
+          from pathlib import Path, PurePosixPath
+          import tempfile
+
+          root = Path("raw").resolve()
+          dist = root / "dist"
+          if dist.is_symlink() or not dist.is_dir():
+              raise SystemExit("::error::raw dist must be a real directory")
+          artifacts = json.loads((dist / "artifacts.json").read_text())
+          if not isinstance(artifacts, list) or not all(isinstance(item, dict) for item in artifacts):
+              raise SystemExit("::error::invalid direct-list artifacts.json")
+          matches = [item for item in artifacts if item.get("type") == "Archive" and item.get("goos") == "linux" and item.get("goarch") == "amd64"]
+          if len(matches) != 1:
+              raise SystemExit("::error::expected one linux/amd64 archive")
+          raw = matches[0].get("path")
+          parts = PurePosixPath(raw).parts
+          if len(parts) != 2 or parts[0] != "dist" or any(part in ("", ".", "..") or part.startswith(".") for part in parts):
+              raise SystemExit("::error::unsafe smoke archive path")
+          archive = root / Path(*parts)
+          if archive.stat().st_size > 256 * 1024 * 1024:
+              raise SystemExit("::error::smoke archive exceeds size limit")
+
+          def octal(field):
+              if field and field[0] & 0x80:
+                  raise SystemExit("::error::smoke TAR uses base-256 metadata")
+              value = field.rstrip(b"\x00 ").lstrip(b" ")
+              if not value or any(byte not in b"01234567" for byte in value):
+                  raise SystemExit("::error::smoke TAR has invalid octal metadata")
+              return int(value, 8)
+
+          def read_exact(stream, size, capture=False):
+              chunks = []
+              remaining = size
+              while remaining:
+                  chunk = stream.read(min(1024 * 1024, remaining))
+                  if not chunk:
+                      raise SystemExit("::error::smoke TAR payload is truncated")
+                  if capture:
+                      chunks.append(chunk)
+                  remaining -= len(chunk)
+              return b"".join(chunks) if capture else None
+
+          payloads = []
+          count = 0
+          expanded = 0
+          with archive.open("rb") as compressed:
+              if compressed.read(2) != b"\x1f\x8b":
+                  raise SystemExit("::error::linux/amd64 smoke archive must be TAR.GZ")
+              compressed.seek(0)
+              with gzip.GzipFile(fileobj=compressed) as stream:
+                  while True:
+                      header = read_exact(stream, 512, capture=True)
+                      if header == b"\x00" * 512:
+                          trailing = 0
+                          while True:
+                              chunk = stream.read(1024 * 1024)
+                              if not chunk:
+                                  break
+                              trailing += len(chunk)
+                              if any(chunk) or trailing > 1024 * 1024:
+                                  raise SystemExit("::error::smoke TAR trailing data is unsafe")
+                          break
+                      count += 1
+                      if count > 128 or header[257:263] != b"ustar\x00" or header[156:157] not in (b"\x00", b"0"):
+                          raise SystemExit("::error::smoke TAR type, format, or count is unsafe")
+                      stored = octal(header[148:156])
+                      if sum(header[:148] + b" " * 8 + header[156:]) != stored:
+                          raise SystemExit("::error::smoke TAR checksum mismatch")
+                      name = header[:100].split(b"\x00", 1)[0].decode("ascii")
+                      prefix = header[345:500].split(b"\x00", 1)[0].decode("ascii")
+                      if prefix:
+                          name = f"{prefix}/{name}"
+                      size = octal(header[124:136])
+                      mode = octal(header[100:108])
+                      expanded += size
+                      if size > 256 * 1024 * 1024 or expanded > 512 * 1024 * 1024 or expanded > max(archive.stat().st_size, 1) * 200:
+                          raise SystemExit("::error::smoke TAR size or ratio limit exceeded")
+                      is_binary = name == os.environ["BINARY_NAME"]
+                      if is_binary and (payloads or not mode & 0o111 or mode & 0o7022):
+                          raise SystemExit("::error::smoke binary metadata is unsafe")
+                      payload = read_exact(stream, size, capture=is_binary)
+                      if is_binary:
+                          payloads.append(payload)
+                      padding = (-size) % 512
+                      if padding:
+                          read_exact(stream, padding)
+          if len(payloads) != 1:
+              raise SystemExit("::error::exact root smoke binary is absent or ambiguous")
+          staged_binary = None
+          stage_path = Path(os.environ["RUNNER_TEMP"]) / "candidate-smoke-stage-path"
+          try:
+              with tempfile.NamedTemporaryFile(prefix="candidate-smoke-staged-", dir=os.environ["RUNNER_TEMP"], delete=False) as staged:
+                  staged.write(payloads[0])
+                  staged_binary = Path(staged.name)
+              staged_binary.chmod(0o600)
+              stage_path.write_text(str(staged_binary))
+          except BaseException:
+              if staged_binary is not None:
+                  staged_binary.unlink(missing_ok=True)
+              stage_path.unlink(missing_ok=True)
+              raise
+          PY
+          staged_binary=
+          sandbox=
+          cleanup_preparation() {
+            status=$?
+            trap - EXIT
+            rm -f "${staged_binary:-}" "$RUNNER_TEMP/candidate-smoke-stage-path"
+            if [[ -n "${sandbox:-}" && "$sandbox" =~ ^/run/go-candidate-smoke\.[A-Za-z0-9]{6}$ ]]; then
+              if ! /usr/bin/sudo -n rm -rf -- "$sandbox"; then
+                exit 1
+              fi
+            fi
+            exit "$status"
+          }
+          trap cleanup_preparation EXIT
+          staged_binary=$(cat "$RUNNER_TEMP/candidate-smoke-stage-path")
+          smoke_user=nobody
+          if [[ "$(cat /proc/1/comm)" != systemd ]] \
+            || [[ ! -x /usr/bin/sudo || ! -x /usr/bin/systemd-run || ! -x /usr/bin/systemctl \
+              || ! -x /usr/bin/timeout || ! -x /usr/bin/env ]] \
+            || ! id "$smoke_user" >/dev/null 2>&1 \
+            || ! /usr/bin/sudo -n true >/dev/null 2>&1; then
+            echo "::error::required systemd smoke isolation is unavailable"
+            exit 1
+          fi
+          smoke_group=$(id -gn "$smoke_user")
+          if [[ ! "$smoke_group" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+            echo "::error::nobody group is unsafe"
+            exit 1
+          fi
+          sandbox=$(/usr/bin/sudo -n mktemp -d /run/go-candidate-smoke.XXXXXX)
+          if [[ ! "$sandbox" =~ ^/run/go-candidate-smoke\.[A-Za-z0-9]{6}$ ]]; then
+            echo "::error::mktemp returned an unexpected smoke sandbox path"
+            exit 1
+          fi
+          /usr/bin/sudo -n chown root:root "$sandbox"
+          /usr/bin/sudo -n chmod 0711 "$sandbox"
+          for name in home tmp config cache data state db work; do
+            /usr/bin/sudo -n install -d -o "$smoke_user" -g "$smoke_group" -m 0700 "$sandbox/$name"
+          done
+          /usr/bin/sudo -n install -o "$smoke_user" -g "$smoke_group" -m 0500 \
+            "$staged_binary" "$sandbox/candidate"
+          rm -f "$staged_binary" "$RUNNER_TEMP/candidate-smoke-stage-path"
+          unit="go-candidate-smoke-$(tr -d '-' < /proc/sys/kernel/random/uuid)"
+          if [[ ! "$unit" =~ ^go-candidate-smoke-[a-f0-9]{32}$ ]]; then
+            echo "::error::generated systemd unit name is invalid"
+            exit 1
+          fi
+          {
+            echo "sandbox=$sandbox"
+            echo "binary=$sandbox/candidate"
+            echo "unit=$unit"
+            echo "group=$smoke_group"
+          } >> "$GITHUB_OUTPUT"
+          trap - EXIT
+
+      - name: Execute candidate in empty environment
+        env:
+          SANDBOX: ${{ steps.extract.outputs.sandbox }}
+          SMOKE_BINARY: ${{ steps.extract.outputs.binary }}
+          SMOKE_UNIT: ${{ steps.extract.outputs.unit }}
+          SMOKE_GROUP: ${{ steps.extract.outputs.group }}
+          CANDIDATE_VERSION: ${{ needs.metadata.outputs.candidate-version }}
+        run: |
+          if [[ ! "$SANDBOX" =~ ^/run/go-candidate-smoke\.[A-Za-z0-9]{6}$ ]] \
+            || [[ "$SMOKE_BINARY" != "$SANDBOX/candidate" ]] \
+            || [[ ! "$SMOKE_UNIT" =~ ^go-candidate-smoke-[a-f0-9]{32}$ ]] \
+            || [[ ! "$SMOKE_GROUP" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+            echo "::error::smoke sandbox, unit, group, or binary path is invalid"
+            exit 1
+          fi
+          cleanup_sandbox() {
+            status=$?
+            trap - EXIT
+            cleanup_failed=false
+            load_state=$(/usr/bin/timeout --signal=KILL 5s /usr/bin/sudo -n \
+              /usr/bin/systemctl show --property=LoadState --value "$SMOKE_UNIT" 2>/dev/null) \
+              || cleanup_failed=true
+            if [[ "$load_state" != not-found ]]; then
+              /usr/bin/timeout --signal=KILL 5s /usr/bin/sudo -n \
+                /usr/bin/systemctl kill --kill-whom=all --signal=KILL "$SMOKE_UNIT" >/dev/null 2>&1 || true
+              /usr/bin/timeout --signal=KILL 5s /usr/bin/sudo -n \
+                /usr/bin/systemctl stop "$SMOKE_UNIT" >/dev/null 2>&1 || true
+              /usr/bin/timeout --signal=KILL 5s /usr/bin/sudo -n \
+                /usr/bin/systemctl reset-failed "$SMOKE_UNIT" >/dev/null 2>&1 || true
+            fi
+            final_state=$(/usr/bin/timeout --signal=KILL 5s /usr/bin/sudo -n \
+              /usr/bin/systemctl show --property=LoadState --value "$SMOKE_UNIT" 2>/dev/null) \
+              || cleanup_failed=true
+            [[ "$final_state" == not-found ]] || cleanup_failed=true
+            /usr/bin/sudo -n rm -rf -- "$SANDBOX" || cleanup_failed=true
+            if [[ "$cleanup_failed" == true ]]; then
+              exit 1
+            fi
+            exit "$status"
+          }
+          trap cleanup_sandbox EXIT
+          if [[ "$(cat /proc/1/comm)" != systemd ]] \
+            || [[ ! -x /usr/bin/systemd-run || ! -x /usr/bin/systemctl || ! -x /usr/bin/sudo \
+              || ! -x /usr/bin/timeout || ! -x /usr/bin/env ]] \
+            || [[ ! -d "$SANDBOX" || "$(stat -c '%U:%G:%a' "$SANDBOX")" != "root:root:711" ]] \
+            || [[ ! -f "$SMOKE_BINARY" || -L "$SMOKE_BINARY" ]]; then
+            echo "::error::required systemd smoke isolation is unavailable or invalid"
+            exit 1
+          fi
+          capture_script="$RUNNER_TEMP/candidate-bounded-capture.py"
+          capture_output="$RUNNER_TEMP/candidate-bounded-output.txt"
+          cat > "$capture_script" <<'PY'
+          import sys
+          limit = 1024 * 1024
+          written = 0
+          exceeded = False
+          with open(sys.argv[1], "wb") as output:
+              while True:
+                  chunk = sys.stdin.buffer.read(65536)
+                  if not chunk:
+                      break
+                  remaining = max(limit - written, 0)
+                  if remaining:
+                      output.write(chunk[:remaining])
+                      written += min(len(chunk), remaining)
+                  if len(chunk) > remaining:
+                      exceeded = True
+          raise SystemExit(73 if exceeded else 0)
+          PY
+          set +e
+          /usr/bin/timeout --signal=TERM --kill-after=2s 15s \
+            /usr/bin/sudo -n /usr/bin/systemd-run \
+              --unit="$SMOKE_UNIT" \
+              --wait --pipe --collect --service-type=exec \
+              --property=User=nobody \
+              --property=Group="$SMOKE_GROUP" \
+              --property=WorkingDirectory="$SANDBOX/work" \
+              --property=RuntimeMaxSec=10s \
+              --property=TimeoutStopSec=2s \
+              --property=KillMode=control-group \
+              --property=SendSIGKILL=yes \
+              --property=NoNewPrivileges=yes \
+              --property=PrivateTmp=yes \
+              --property=ProtectSystem=strict \
+              --property=ProtectHome=yes \
+              --property=RestrictSUIDSGID=yes \
+              --property=UMask=0077 \
+              --property=MemoryMax=512M \
+              --property=TasksMax=64 \
+              --property=CPUQuota=100% \
+              --property=LimitFSIZE=1M \
+              --property=PrivateNetwork=yes \
+              --property=ReadWritePaths="$SANDBOX/home" \
+              --property=ReadWritePaths="$SANDBOX/tmp" \
+              --property=ReadWritePaths="$SANDBOX/config" \
+              --property=ReadWritePaths="$SANDBOX/cache" \
+              --property=ReadWritePaths="$SANDBOX/data" \
+              --property=ReadWritePaths="$SANDBOX/state" \
+              --property=ReadWritePaths="$SANDBOX/db" \
+              --property=ReadWritePaths="$SANDBOX/work" \
+              /usr/bin/env -i \
+                HOME="$SANDBOX/home" \
+                TMPDIR="$SANDBOX/tmp" \
+                XDG_CONFIG_HOME="$SANDBOX/config" \
+                XDG_CACHE_HOME="$SANDBOX/cache" \
+                XDG_DATA_HOME="$SANDBOX/data" \
+                XDG_STATE_HOME="$SANDBOX/state" \
+                DATABASE_URL="sqlite:///$SANDBOX/db/candidate.db" \
+                USER=nobody \
+                LOGNAME=nobody \
+                "$SMOKE_BINARY" --version 2>&1 \
+            | python3 "$capture_script" "$capture_output"
+          pipeline_status=("${PIPESTATUS[@]}")
+          set -e
+          rm -f "$capture_script"
+          if (( pipeline_status[0] != 0 || pipeline_status[1] != 0 )); then
+            echo "::error::systemd candidate execution failed or exceeded output limit"
+            exit 1
+          fi
+          version_output=$(cat "$capture_output")
+          rm -f "$capture_output"
+          if [[ "$version_output" != *"$CANDIDATE_VERSION"* ]] || [[ "${version_output,,}" == *dev* ]]; then
+            echo "::error::isolated --version output is not the candidate version"
+            exit 1
+          fi
+
+  publish:
+    name: Publish validated candidate
+    needs: [metadata, build, static-validate, smoke]
+    runs-on: ubuntu-24.04
+    permissions: {}
+    outputs:
+      artifact-id: ${{ steps.final.outputs.artifact-id }}
+      artifact-digest: ${{ steps.final.outputs.artifact-digest }}
+      artifact-name: ${{ steps.manifest.outputs.artifact_name }}
+      candidate-version: ${{ needs.metadata.outputs.candidate-version }}
+      source-sha: ${{ needs.metadata.outputs.source-sha }}
+    steps:
+      - name: Download exact raw artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          artifact-ids: ${{ needs.build.outputs.raw-artifact-id }}
+          path: raw
+          merge-multiple: true
+
+      - name: Revalidate inventory and create manifest
+        id: manifest
+        env:
+          SOURCE_SHA: ${{ needs.metadata.outputs.source-sha }}
+          BASE_SHA: ${{ needs.metadata.outputs.base-sha }}
+          BASE_VERSION: ${{ needs.metadata.outputs.base-version }}
+          CANDIDATE_VERSION: ${{ needs.metadata.outputs.candidate-version }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+          BINARY_NAME: ${{ inputs.binary-name }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path, PurePosixPath
+          import re
+          import shutil
+          import stat
+
+          root = Path("raw").resolve()
+          dist = root / "dist"
+          if dist.is_symlink() or not dist.is_dir():
+              raise SystemExit("::error::raw dist must be a real directory")
+
+          def regular(path):
+              if path.is_symlink() or not path.is_file() or not stat.S_ISREG(path.stat(follow_symlinks=False).st_mode):
+                  raise SystemExit("::error::publish input is not regular")
+              return path
+
+          artifacts = json.loads(regular(dist / "artifacts.json").read_text())
+          if not isinstance(artifacts, list) or not all(isinstance(item, dict) for item in artifacts):
+              raise SystemExit("::error::invalid artifacts.json")
+          archives = [item for item in artifacts if item.get("type") == "Archive"]
+          checksum_items = [item for item in artifacts if item.get("type") == "Checksum"]
+          expected_matrix = {
+              ("linux", "amd64"), ("linux", "arm64"),
+              ("darwin", "amd64"), ("darwin", "arm64"),
+              ("windows", "amd64"), ("windows", "arm64"),
+          }
+          matrix = [(item.get("goos"), item.get("goarch")) for item in archives]
+          if (len(archives) != 6 or not all(isinstance(value, str) for platform in matrix for value in platform)
+                  or len(set(matrix)) != 6 or set(matrix) != expected_matrix or len(checksum_items) != 1):
+              raise SystemExit("::error::invalid publish six-target scalar inventory")
+
+          windows_devices = {"CON", "PRN", "AUX", "NUL", *(f"COM{number}" for number in range(1, 10)), *(f"LPT{number}" for number in range(1, 10))}
+
+          def portable_basename(value):
+              if (not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", value)
+                      or value.endswith((".", " ")) or value.split(".", 1)[0].upper() in windows_devices):
+                  raise SystemExit("::error::publish basename is not portable")
+              return value
+
+          def declared_path(item):
+              raw = item.get("path")
+              basename = portable_basename(raw.removeprefix("dist/")) if isinstance(raw, str) else None
+              if raw != f"dist/{basename}":
+                  raise SystemExit("::error::publish path must be literal dist/basename")
+              parts = PurePosixPath(raw).parts if isinstance(raw, str) else ()
+              if (len(parts) != 2 or parts[0] != "dist" or "/".join(parts) != raw
+                      or any(part in ("", ".", "..") or part.startswith(".") for part in parts)):
+                  raise SystemExit("::error::unsafe publish path")
+              return regular(root / Path(*parts))
+
+          archive_paths = [(item, declared_path(item)) for item in archives]
+          checksum_path = declared_path(checksum_items[0])
+          declared_names = [portable_basename(path.name) for _, path in archive_paths] + [portable_basename(checksum_path.name)]
+          reserved = {"candidate.json", "artifacts.json", "metadata.json"}
+          collision_keys = {name.rstrip(" .").casefold() for name in declared_names}
+          if checksum_items[0].get("path") != "dist/checksums.txt":
+              raise SystemExit("::error::publish checksum path must be exactly dist/checksums.txt")
+          if (len(declared_names) != 7 or len(collision_keys) != 7
+                  or collision_keys & reserved):
+              raise SystemExit("::error::publish declared basenames collide or are reserved")
+          expected = ["artifacts.json", "metadata.json", *declared_names]
+          actual_entries = list(dist.iterdir())
+          actual = [path.name for path in actual_entries]
+          if (len(expected) != 9 or len(actual) != 9 or sorted(actual) != sorted(expected)
+                  or any(path.is_symlink() or not path.is_file() for path in actual_entries)):
+              raise SystemExit("::error::publish inventory or cardinality mismatch")
+          checksums = {}
+          for line in checksum_path.read_text().splitlines():
+              match = re.fullmatch(r"([0-9a-fA-F]{64})  ([A-Za-z0-9][A-Za-z0-9._-]*)", line)
+              if not match or match.group(2) in checksums:
+                  raise SystemExit("::error::invalid publish checksum")
+              checksums[match.group(2)] = match.group(1).lower()
+          archive_names = [path.name for _, path in archive_paths]
+          if len(checksums) != 6 or set(checksums) != set(archive_names):
+              raise SystemExit("::error::publish checksums are not one-to-one")
+          source_sha = os.environ["SOURCE_SHA"]
+          base_sha = os.environ["BASE_SHA"]
+          base_version = os.environ["BASE_VERSION"]
+          candidate_version = os.environ["CANDIDATE_VERSION"]
+          pr_number = os.environ["PR_NUMBER"]
+          binary_name = os.environ["BINARY_NAME"]
+          if not re.fullmatch(r"[0-9a-f]{40}", source_sha) or not re.fullmatch(r"[0-9a-f]{40}", base_sha):
+              raise SystemExit("::error::manifest SHA scalar is invalid")
+          if not re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", base_version):
+              raise SystemExit("::error::manifest base version scalar is invalid")
+          if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-pr\.[1-9][0-9]*\.g[0-9a-f]{7}", candidate_version):
+              raise SystemExit("::error::manifest candidate version scalar is invalid")
+          if not re.fullmatch(r"[1-9][0-9]*", pr_number):
+              raise SystemExit("::error::manifest PR scalar is invalid")
+          portable_basename(binary_name)
+          if binary_name.casefold() in {"candidate.json", "artifacts.json", "metadata.json", "checksums.txt"}:
+              raise SystemExit("::error::manifest binary scalar is reserved")
+          metadata = json.loads(regular(dist / "metadata.json").read_text())
+          if metadata.get("version") != os.environ["CANDIDATE_VERSION"] or str(metadata.get("commit", "")).lower() != os.environ["SOURCE_SHA"]:
+              raise SystemExit("::error::publish metadata mismatch")
+
+          def stream_sha256(path):
+              digest = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
+          manifest_archives = []
+          for item, path in sorted(archive_paths, key=lambda pair: pair[1].name):
+              digest = stream_sha256(path)
+              if checksums.get(path.name) != digest:
+                  raise SystemExit("::error::publish archive checksum mismatch")
+              manifest_archives.append({
+                  "file": path.name,
+                  "goarch": item["goarch"],
+                  "goos": item["goos"],
+                  "name": binary_name,
+                  "sha256": digest,
+              })
+          stage = Path("candidate-upload")
+          if stage.exists():
+              shutil.rmtree(stage)
+          stage.mkdir()
+          for _, path in sorted(archive_paths, key=lambda pair: pair[1].name):
+              shutil.copy2(path, stage / path.name)
+          shutil.copy2(checksum_path, stage / checksum_path.name)
+          manifest = {
+              "archives": manifest_archives,
+              "base": base_sha,
+              "base_version": base_version,
+              "candidate_version": candidate_version,
+              "pr": int(pr_number),
+              "schema": 1,
+              "sha": source_sha,
+          }
+          (stage / "candidate.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+          expected_stage = sorted([*archive_names, checksum_path.name, "candidate.json"])
+          actual_stage_entries = list(stage.iterdir())
+          actual_stage = sorted(path.name for path in actual_stage_entries)
+          if (len(expected_stage) != 8 or len(actual_stage) != 8 or actual_stage != expected_stage
+                  or any(path.is_symlink() or not path.is_file() for path in actual_stage_entries)):
+              raise SystemExit("::error::final stage allowlist or cardinality mismatch")
+          artifact_name = f"go-candidate-pr-{os.environ['PR_NUMBER']}-{os.environ['SOURCE_SHA']}"
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+              print(f"artifact_name={artifact_name}", file=output)
+          PY
+
+      - name: Upload final validated candidate
+        id: final
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: ${{ steps.manifest.outputs.artifact_name }}
+          path: candidate-upload/
+          compression-level: 0
+          include-hidden-files: false
+          retention-days: 7
+          overwrite: false
+          if-no-files-found: error

@@ -10,6 +10,7 @@ Shared CI/CD infrastructure for the [pablontiv](https://github.com/pablontiv) ec
 | Security scanning | `codeql.yml`, `gitleaks.yml`, `scorecard.yml` |
 | Go CI (build, test, lint, vuln) | `go-ci.yml` |
 | Rust CI (check, test, audit) | `rust-ci.yml` |
+| PR pre-release artifacts | `go-candidate.yml` |
 | Auto-tag + release | `go-release.yml`, `rust-release.yml` |
 | Baseline tool configs | `configs/` (golangci, goreleaser, rustfmt, clippy, deny, editorconfig) |
 | Community file templates | `templates/` (CONTRIBUTING, SECURITY, issue templates) |
@@ -108,6 +109,7 @@ Crossbeam does not run code. It **defines the rules** under which all other repo
 | `go-ci.yml` | Build, test, tidy, lint, vuln | rootline, roadmapctl, backscroll |
 | `rust-ci.yml` | Check, test, audit | — |
 | `go-release.yml` | Auto-tag + goreleaser | rootline, roadmapctl, backscroll |
+| `go-candidate.yml` | Opt-in, read-only Go PR candidate artifacts | — |
 | `rust-release.yml` | Auto-tag + multi-platform builds | — |
 
 ### Configuration Files
@@ -154,6 +156,110 @@ jobs:
       id-token: write
       attestations: write
 ```
+
+### Go PR candidate artifacts
+
+`go-candidate.yml` is an opt-in `workflow_call` for public Go repositories. The caller owns the trigger, job-level `if`, and `needs`, and must pin Crossbeam to a full commit SHA rather than a movable tag.
+
+Required inputs are `source-repository`, 40-hex `source-sha`, 40-hex `base-sha`, positive `pr-number`, `binary-name`, and an exact trusted Go patch in `go-version` (for example `1.24.1`). `goreleaser-config` defaults to `.goreleaser.yml`; it is always read from the caller repository at `base-sha`, never from the PR checkout. The trusted config must retain this snapshot template:
+
+```yaml
+snapshot:
+  version_template: "{{ incpatch .Version }}-pr.{{ .Env.PR_NUMBER }}.g{{ .ShortCommit }}"
+```
+
+This template is an explicit opt-in prerequisite. Existing Rootline and Roadmapctl release configurations are not compatible until they adopt it; that is expected and is not a defect in this reusable. Backscroll adopted the template in merged PR #105, released in v3.10.1.
+
+The PR must be rebased so `base-sha` is an ancestor of `source-sha`. If the base branch changes, regenerate the candidate with the new base SHA.
+
+Mandatory PR candidates can be wired after caller checks:
+
+```yaml
+on:
+  pull_request:
+
+jobs:
+  test:
+    uses: pablontiv/crossbeam/.github/workflows/go-ci.yml@<40-character-crossbeam-sha>
+
+  candidate:
+    needs: [test]
+    uses: pablontiv/crossbeam/.github/workflows/go-candidate.yml@<40-character-crossbeam-sha>
+    permissions:
+      pull-requests: read
+    with:
+      source-repository: ${{ github.event.pull_request.head.repo.full_name }}
+      source-sha: ${{ github.event.pull_request.head.sha }}
+      base-sha: ${{ github.event.pull_request.base.sha }}
+      pr-number: ${{ github.event.pull_request.number }}
+      binary-name: my-tool
+      go-version: 1.24.1
+```
+
+A manual caller passes the same immutable PR identity explicitly:
+
+```yaml
+on:
+  workflow_dispatch:
+    inputs:
+      source-repository: { required: true, type: string }
+      source-sha: { required: true, type: string }
+      base-sha: { required: true, type: string }
+      pr-number: { required: true, type: number }
+
+jobs:
+  candidate:
+    uses: pablontiv/crossbeam/.github/workflows/go-candidate.yml@<40-character-crossbeam-sha>
+    permissions:
+      pull-requests: read
+    with:
+      source-repository: ${{ inputs.source-repository }}
+      source-sha: ${{ inputs.source-sha }}
+      base-sha: ${{ inputs.base-sha }}
+      pr-number: ${{ inputs.pr-number }}
+      binary-name: my-tool
+      go-version: 1.24.1
+```
+
+For label-controlled publication, keep policy and dependencies in the caller:
+
+```yaml
+on:
+  pull_request:
+    types: [labeled, synchronize, reopened]
+
+jobs:
+  test:
+    uses: pablontiv/crossbeam/.github/workflows/go-ci.yml@<40-character-crossbeam-sha>
+
+  candidate:
+    if: contains(github.event.pull_request.labels.*.name, 'candidate')
+    needs: [test]
+    uses: pablontiv/crossbeam/.github/workflows/go-candidate.yml@<40-character-crossbeam-sha>
+    permissions:
+      pull-requests: read
+    with:
+      source-repository: ${{ github.event.pull_request.head.repo.full_name }}
+      source-sha: ${{ github.event.pull_request.head.sha }}
+      base-sha: ${{ github.event.pull_request.base.sha }}
+      pr-number: ${{ github.event.pull_request.number }}
+      binary-name: my-tool
+      go-version: 1.24.1
+```
+
+The workflow isolates trust boundaries across fresh jobs:
+
+1. `metadata` reads only the PR API and the public caller Git graph.
+2. `build` has no repository permission, installs the exact Go toolchain and GoReleaser before fetching source, uses only the base-SHA GoReleaser config, and uploads one bounded raw artifact.
+3. `static-validate` downloads that exact artifact ID and validates the direct-list GoReleaser manifest, one-to-one checksums, the six-target Linux/Darwin/Windows amd64/arm64 matrix, exact compiler version, executable headers, safe modes, and every archive member without executing the candidate. Unix archives require one root `binary-name`; Windows archives require one root `binary-name.exe`. Every other member must be bounded UTF-8 documentation: a root `LICENSE`, `README`, `CHANGELOG`, or `NOTICE` variant (`.md`/`.txt` allowed), or a canonical `docs/*.md` path. Arbitrary payloads, code, libraries, executable documentation, binary content, and disallowed Unicode controls are rejected. UTF-8 prose may have one leading BOM (removed during decoding); tab, LF, and CR are the only accepted `Cc` characters, and ZWNJ U+200C plus ZWJ U+200D are the only accepted `Cf` characters. Embedded BOMs, C1 controls, and bidi controls remain invalid. Artifact basenames and archive path components use the exact portable ASCII grammar `[A-Za-z0-9][A-Za-z0-9._-]*`, reject Windows device/ADS names and trailing dot/space forms, and are collision-checked case-insensitively; the checksum file is exactly `checksums.txt`.
+4. `smoke` downloads the same artifact ID, safely materializes only the Linux/amd64 binary, and executes it as the final step under an empty environment and temporary HOME/XDG/database paths.
+5. `publish` runs fresh only after static validation and smoke succeed, downloads the same immutable raw artifact, regenerates `candidate.json`, and uploads the final allowlisted artifact.
+
+Top-level permissions are empty. Only `metadata` receives `pull-requests: read`; the API token is scoped to its validation step. Source fetches are anonymous HTTPS and initial support is therefore limited to public repositories. No workflow secret, OIDC permission, write permission, tag, release, or persisted Git credential is used. GitHub artifact/setup actions may use Actions-internal runtime tokens inside their host actions; those tokens are not passed to the candidate process or GoReleaser CLI.
+
+The workflow deliberately builds and smoke-tests untrusted fork code. Fresh runners prevent build persistence from reaching validation or publication. On Ubuntu 24.04, smoke execution fails closed unless PID 1 is systemd and launches a uniquely named transient service as `nobody` below a root-owned `/run/go-candidate-smoke.*` sandbox. The service has an empty explicit environment, cgroup-wide termination, bounded runtime/memory/tasks/CPU/file size, and a private network. The persistent host filesystem is read-only except for explicit sandbox paths; `PrivateTmp` separately supplies private writable `/tmp` and `/var/tmp`. Captured output retained for validation is capped at 1 MiB, while the pipe is drained only until the unit's 10-second runtime limit; total bytes generated by the candidate are not claimed to be capped. A runner-UID GNU `timeout` remains outside the service as a client watchdog. Cleanup uses bounded `systemctl` kill/stop/reset operations, verifies the unit is `not-found`, and removes the sandbox on success or failure; there is no PID scanning fallback. This is still a same-host systemd service rather than a VM, container boundary, seccomp profile, or separate kernel. A short-lived raw artifact necessarily exists before validation; only the final validated candidate is published after the complete DAG and isolated local smoke verification succeed.
+
+The local suite uses real cross-compiled Go binaries and handcrafted bounded archive fixtures, but does not install GoReleaser. A hosted Backscroll canary using the trusted base configuration is mandatory before merge.
 
 ---
 
@@ -225,6 +331,7 @@ jobs:
 | [go-ci.yml](.github/workflows/go-ci.yml) | Go CI: profile (light/full), coverage threshold, lint gate |
 | [rust-ci.yml](.github/workflows/rust-ci.yml) | Rust CI: profile (light/full), toolchain, deny checks |
 | [go-release.yml](.github/workflows/go-release.yml) | Auto-tag + goreleaser: quality gates, graduation threshold |
+| [go-candidate.yml](.github/workflows/go-candidate.yml) | Opt-in Go PR candidate snapshots and interface |
 | [codeql.yml](.github/workflows/codeql.yml) | CodeQL: language input, nightly schedule |
 | [scorecard.yml](.github/workflows/scorecard.yml) | OpenSSF Scorecard: SARIF upload |
 | [gitleaks.yml](.github/workflows/gitleaks.yml) | Secret scanning |
