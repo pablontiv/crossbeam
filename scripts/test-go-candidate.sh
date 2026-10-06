@@ -337,6 +337,10 @@ for goos, goarch in platforms:
             elif is_primary and mode == "unicode-bidi-202e": add_tar(bundle, "tool", payload, 0o755); add_tar(bundle, "README.md", "text\u202eformat".encode(), 0o644)
             elif is_primary and mode == "unicode-bidi-2066": add_tar(bundle, "tool", payload, 0o755); add_tar(bundle, "README.md", "text\u2066format".encode(), 0o644)
             elif is_primary and mode == "unicode-embedded-bom": add_tar(bundle, "tool", payload, 0o755); add_tar(bundle, "README.md", "text\ufeffembedded".encode(), 0o644)
+            elif is_primary and mode == "member-device": add_tar(bundle, "tool", payload, 0o755); add_tar(bundle, "docs/CON.md", b"docs", 0o644)
+            elif is_primary and mode == "member-trailing-dot": add_tar(bundle, "tool", payload, 0o755); add_tar(bundle, "docs/guide.md.", b"docs", 0o644)
+            elif is_primary and mode == "member-colon": add_tar(bundle, "tool", payload, 0o755); add_tar(bundle, "docs/guide:ads.md", b"docs", 0o644)
+            elif is_primary and mode == "member-unicode": add_tar(bundle, "tool", payload, 0o755); add_tar(bundle, "docs/café.md", b"docs", 0o644)
             else:
                 add_tar(bundle, expected_binary, payload, 0o755)
                 docs = b"representative backscroll docs" if goos == "linux" else b"representative rootline docs"
@@ -405,6 +409,26 @@ if mode == "checksum-mismatch": checksum_lines[0] = "0" * 64 + checksum_lines[0]
 if mode == "checksum-extra": checksum_lines.append("0" * 64 + "  extra.tar.gz")
 if mode == "checksum-duplicate": checksum_lines.append(checksum_lines[0])
 (dist / "checksums.txt").write_text("\n".join(checksum_lines) + "\n")
+invalid_archive_names = {
+    "basename-device": "CON.zip",
+    "basename-device-extension": "COM1.tar.gz",
+    "basename-colon": "archive:ads.zip",
+    "basename-unicode": "café.zip",
+    "basename-trailing-dot": "archive.",
+    "basename-trailing-space": "archive.zip ",
+    "basename-hidden": ".archive.zip",
+    "basename-control": "archive\n.zip",
+    "basename-separator": "nested/archive.zip",
+}
+if mode in invalid_archive_names:
+    archives[0]["path"] = f"dist/{invalid_archive_names[mode]}"
+if mode == "basename-case-collision":
+    first = dist / Path(archives[0]["path"]).name
+    second = dist / Path(archives[1]["path"]).name
+    (dist / "Archive.zip").write_bytes(first.read_bytes())
+    (dist / "archive.zip").write_bytes(second.read_bytes())
+    archives[0]["path"] = "dist/Archive.zip"
+    archives[1]["path"] = "dist/archive.zip"
 if mode == "reserved-archive":
     (dist / "candidate.json").write_bytes((dist / Path(archives[0]["path"]).name).read_bytes())
     archives[0]["path"] = "dist/candidate.json"
@@ -414,6 +438,9 @@ if mode == "untrusted-artifact-name":
     for item in archives: item["name"] = {"untrusted": ["object"]}
 checksum_item = {"type": "Checksum", "name": "checksums", "path": "dist/checksums.txt"}
 if mode == "reserved-checksum": checksum_item["path"] = "dist/metadata.json"
+if mode == "checksum-renamed":
+    (dist / "sums.txt").write_bytes((dist / "checksums.txt").read_bytes())
+    checksum_item["path"] = "dist/sums.txt"
 artifacts = archives + [checksum_item]
 if mode == "wrapper-shape": artifacts = {"artifacts": artifacts}
 (dist / "artifacts.json").write_text(json.dumps(artifacts))
@@ -535,6 +562,21 @@ run_static_case "Unicode C1 U+009B rejected" unicode-c1-9b failure
 run_static_case "Unicode bidi U+202E rejected" unicode-bidi-202e failure
 run_static_case "Unicode bidi U+2066 rejected" unicode-bidi-2066 failure
 run_static_case "embedded Unicode BOM U+FEFF rejected" unicode-embedded-bom failure
+run_static_case "Windows device archive basename rejected" basename-device failure
+run_static_case "Windows device basename with extension rejected" basename-device-extension failure
+run_static_case "ADS colon archive basename rejected" basename-colon failure
+run_static_case "Unicode archive basename rejected" basename-unicode failure
+run_static_case "trailing-dot archive basename rejected" basename-trailing-dot failure
+run_static_case "trailing-space archive basename rejected" basename-trailing-space failure
+run_static_case "hidden archive basename rejected" basename-hidden failure
+run_static_case "control archive basename rejected" basename-control failure
+run_static_case "separator in archive basename rejected" basename-separator failure
+run_static_case "case-insensitive archive basename collision rejected" basename-case-collision failure
+run_static_case "renamed checksum file rejected" checksum-renamed failure
+run_static_case "Windows device archive member rejected" member-device failure
+run_static_case "trailing-dot archive member rejected" member-trailing-dot failure
+run_static_case "ADS colon archive member rejected" member-colon failure
+run_static_case "Unicode archive member rejected" member-unicode failure
 run_static_case "Windows malware exe rejected even non-executable" windows-malware-exe failure
 run_static_case "Windows malware dll rejected even non-executable" windows-malware-dll failure
 run_static_case "Windows malware cmd rejected even non-executable" windows-malware-cmd failure
@@ -602,10 +644,12 @@ PY
 extract_output="$smoke_dir/extract-output"
 if [[ "$(uname -s)" == Linux ]]; then
   linux_ready=true
+  [[ "$(cat /proc/1/comm 2>/dev/null)" == systemd ]] || linux_ready=false
   id nobody >/dev/null 2>&1 || linux_ready=false
   [[ -x /usr/bin/sudo && -x /usr/bin/env && -x /usr/bin/timeout \
-    && -x /usr/bin/pkill && -x /usr/bin/pgrep ]] || linux_ready=false
-  /usr/bin/sudo -n -u nobody true >/dev/null 2>&1 || linux_ready=false
+    && -x /usr/bin/systemd-run && -x /usr/bin/systemctl && -x /usr/bin/setsid \
+    && -x /usr/bin/pgrep ]] || linux_ready=false
+  /usr/bin/sudo -n true >/dev/null 2>&1 || linux_ready=false
   if [[ "$linux_ready" != true ]]; then
     record "Linux smoke isolation prerequisites are mandatory" available unavailable
   else
@@ -620,13 +664,15 @@ if [[ "$(uname -s)" == Linux ]]; then
         bash -c "cd '$smoke_dir' && '$TEST_ROOT/extract.sh'"
       sandbox=$(sed -n 's/^sandbox=//p' "$extract_output")
       binary=$(sed -n 's/^binary=//p' "$extract_output")
+      unit=$(sed -n 's/^unit=//p' "$extract_output")
+      smoke_group=$(sed -n 's/^group=//p' "$extract_output")
     }
 
-    before_sandboxes=$(find /var/tmp -maxdepth 1 -type d -name 'go-candidate-smoke.*' -print | sort)
+    before_sandboxes=$(find /run -maxdepth 1 -type d -name 'go-candidate-smoke.*' -print 2>/dev/null | sort)
     expect_status "failed preparation triggers partial sandbox cleanup" failure "$smoke_dir/partial-cleanup.log" \
       env BINARY_NAME=tool GITHUB_OUTPUT=/dev/full RUNNER_TEMP="$smoke_runner_temp" \
       bash -c "cd '$smoke_dir' && '$TEST_ROOT/extract.sh'"
-    after_sandboxes=$(find /var/tmp -maxdepth 1 -type d -name 'go-candidate-smoke.*' -print | sort)
+    after_sandboxes=$(find /run -maxdepth 1 -type d -name 'go-candidate-smoke.*' -print 2>/dev/null | sort)
     record "partial preparation leaves no sandbox" "$before_sandboxes" "$after_sandboxes"
     remaining_staged=$(find "$smoke_runner_temp" -maxdepth 1 -name 'candidate-smoke-*' -print -quit)
     record "partial preparation removes staged binary" absent "$([[ -n "$remaining_staged" ]] && echo present || echo absent)"
@@ -634,16 +680,16 @@ if [[ "$(uname -s)" == Linux ]]; then
     prepare_smoke success
     success_sandbox=$sandbox
     record "smoke binary is owned by nobody" nobody "$(stat -c '%U' "$binary")"
-    expect_status "isolated candidate smoke succeeds as nobody" success "$smoke_dir/smoke.log" \
-      env SANDBOX="$sandbox" SMOKE_BINARY="$binary" CANDIDATE_VERSION="$candidate_version" \
-      "$TEST_ROOT/smoke.sh"
+    expect_status "isolated candidate smoke succeeds in systemd cgroup" success "$smoke_dir/smoke.log" \
+      env SANDBOX="$sandbox" SMOKE_BINARY="$binary" SMOKE_UNIT="$unit" SMOKE_GROUP="$smoke_group" \
+      CANDIDATE_VERSION="$candidate_version" "$TEST_ROOT/smoke.sh"
     record "successful smoke removes sandbox" absent "$([[ -e "$success_sandbox" ]] && echo present || echo absent)"
 
     prepare_smoke failure
     failure_sandbox=$sandbox
     expect_status "smoke version failure blocks success" failure "$smoke_dir/smoke-fail.log" \
-      env SANDBOX="$sandbox" SMOKE_BINARY="$binary" CANDIDATE_VERSION=9.9.9-bad \
-      "$TEST_ROOT/smoke.sh"
+      env SANDBOX="$sandbox" SMOKE_BINARY="$binary" SMOKE_UNIT="$unit" SMOKE_GROUP="$smoke_group" \
+      CANDIDATE_VERSION=9.9.9-bad "$TEST_ROOT/smoke.sh"
     record "failed smoke removes sandbox" absent "$([[ -e "$failure_sandbox" ]] && echo present || echo absent)"
 
     prepare_smoke probe
@@ -664,7 +710,7 @@ PROBE
     sudo -n install -o nobody -g "$(id -gn nobody)" -m 0500 "$malicious" "$sandbox/candidate"
     expect_status "malicious candidate cannot read sentinel from ancestor environments" success "$smoke_dir/probe.log" \
       env SMOKE_SENTINEL_SECRET=must-not-leak SANDBOX="$sandbox" SMOKE_BINARY="$sandbox/candidate" \
-      CANDIDATE_VERSION="$candidate_version" "$TEST_ROOT/smoke.sh"
+      SMOKE_UNIT="$unit" SMOKE_GROUP="$smoke_group" CANDIDATE_VERSION="$candidate_version" "$TEST_ROOT/smoke.sh"
     record "probe smoke removes sandbox" absent "$([[ -e "$probe_sandbox" ]] && echo present || echo absent)"
 
     prepare_smoke sigstop
@@ -677,38 +723,59 @@ printf '%s\n' 'tool $candidate_version'
 STOPPER
     /usr/bin/sudo -n install -o nobody -g "$(id -gn nobody)" -m 0500 "$sigstop_candidate" "$sandbox/candidate"
     expect_status "candidate cannot stop outer watchdog via parent SIGSTOP" success "$smoke_dir/sigstop.log" \
-      env SANDBOX="$sandbox" SMOKE_BINARY="$sandbox/candidate" CANDIDATE_VERSION="$candidate_version" \
-      "$TEST_ROOT/smoke.sh"
+      env SANDBOX="$sandbox" SMOKE_BINARY="$sandbox/candidate" SMOKE_UNIT="$unit" SMOKE_GROUP="$smoke_group" \
+      CANDIDATE_VERSION="$candidate_version" "$TEST_ROOT/smoke.sh"
     record "SIGSTOP probe removes sandbox" absent "$([[ -e "$sigstop_sandbox" ]] && echo present || echo absent)"
 
-    prepare_smoke ignore-term
-    ignore_sandbox=$sandbox
-    ignore_candidate="$smoke_dir/ignore-term"
-    cat > "$ignore_candidate" <<'IGNORER'
+    prepare_smoke escaped-child
+    escape_sandbox=$sandbox
+    escape_unit=$unit
+    escape_candidate="$smoke_dir/escaped-child"
+    cat > "$escape_candidate" <<'ESCAPER'
 #!/bin/sh
 if [ "${1:-}" = child ]; then
   trap '' TERM
   while :; do sleep 1; done
 fi
-"$0" child &
-trap '' TERM
-while :; do sleep 1; done
-IGNORER
-    /usr/bin/sudo -n install -o nobody -g "$(id -gn nobody)" -m 0500 "$ignore_candidate" "$sandbox/candidate"
+/usr/bin/setsid "$0" child &
+exit 0
+ESCAPER
+    /usr/bin/sudo -n install -o nobody -g "$(id -gn nobody)" -m 0500 "$escape_candidate" "$sandbox/candidate"
     started=$SECONDS
-    expect_status "SIGTERM-ignoring candidate is forcibly bounded" failure "$smoke_dir/ignore-term.log" \
-      env SANDBOX="$sandbox" SMOKE_BINARY="$sandbox/candidate" CANDIDATE_VERSION="$candidate_version" \
-      "$TEST_ROOT/smoke.sh"
+    expect_status "setsid TERM-ignoring child with preserved pipe is cgroup-bounded" failure "$smoke_dir/escaped-child.log" \
+      env SANDBOX="$sandbox" SMOKE_BINARY="$sandbox/candidate" SMOKE_UNIT="$unit" SMOKE_GROUP="$smoke_group" \
+      CANDIDATE_VERSION="$candidate_version" "$TEST_ROOT/smoke.sh"
     elapsed=$((SECONDS - started))
-    if (( elapsed <= 20 )); then
-      actual_bound=bounded
-    else
-      actual_bound="${elapsed}s"
-    fi
-    record "TERM-ignoring runtime stays bounded" bounded "$actual_bound"
-    record "watchdog cleanup kills candidate descendants" absent \
-      "$(/usr/bin/pgrep -f -- "$ignore_sandbox/candidate child" >/dev/null && echo present || echo absent)"
-    record "TERM-ignoring smoke removes sandbox" absent "$([[ -e "$ignore_sandbox" ]] && echo present || echo absent)"
+    if (( elapsed <= 20 )); then actual_bound=bounded; else actual_bound="${elapsed}s"; fi
+    record "escaped child runtime stays bounded" bounded "$actual_bound"
+    record "systemd cgroup leaves no escaped child" absent \
+      "$(/usr/bin/pgrep -f -- "$escape_sandbox/candidate child" >/dev/null && echo present || echo absent)"
+    escape_state=$(/usr/bin/systemctl show --property=LoadState --value "$escape_unit")
+    record "escaped child unit is collected" not-found "$escape_state"
+    record "escaped child sandbox is removed" absent "$([[ -e "$escape_sandbox" ]] && echo present || echo absent)"
+
+    prepare_smoke endless-output
+    output_sandbox=$sandbox
+    output_unit=$unit
+    output_candidate="$smoke_dir/endless-output"
+    cat > "$output_candidate" <<'OUTPUTTER'
+#!/bin/sh
+trap '' TERM
+while :; do
+  printf '%65536s' x
+ done
+OUTPUTTER
+    /usr/bin/sudo -n install -o nobody -g "$(id -gn nobody)" -m 0500 "$output_candidate" "$sandbox/candidate"
+    started=$SECONDS
+    expect_status "hostile endless output is bounded" failure "$smoke_dir/endless-output.log" \
+      env SANDBOX="$sandbox" SMOKE_BINARY="$sandbox/candidate" SMOKE_UNIT="$unit" SMOKE_GROUP="$smoke_group" \
+      CANDIDATE_VERSION="$candidate_version" "$TEST_ROOT/smoke.sh"
+    elapsed=$((SECONDS - started))
+    if (( elapsed <= 20 )); then actual_bound=bounded; else actual_bound="${elapsed}s"; fi
+    record "endless output runtime stays bounded" bounded "$actual_bound"
+    output_state=$(/usr/bin/systemctl show --property=LoadState --value "$output_unit")
+    record "endless output unit is collected" not-found "$output_state"
+    record "endless output sandbox is removed" absent "$([[ -e "$output_sandbox" ]] && echo present || echo absent)"
   fi
 else
   printf '  SKIP: dynamic nobody smoke and procfs probe require Linux\n'
@@ -795,13 +862,15 @@ checks = {
     "PR config never selected": "go-version-file" not in text and "inputs.goreleaser-config }}" not in text.split("Build candidate with sanitized environment", 1)[1],
     "goreleaser action install only": "install-only: true" in text,
     "smoke execution is last": "\n      - name:" not in execute_section,
-    "smoke uses distinct nobody UID": "/usr/bin/sudo -n -u nobody -- /usr/bin/env -i" in execute_section,
-    "watchdog precedes adversarial UID": execute_section.index("/usr/bin/timeout --signal=TERM --kill-after=2s 10s") < execute_section.index("/usr/bin/sudo -n -u nobody") < execute_section.index("/usr/bin/env -i"),
+    "smoke uses systemd nobody identity": "--property=User=nobody" in execute_section and "--property=Group=\"$SMOKE_GROUP\"" in execute_section,
+    "watchdog precedes systemd client": execute_section.index("/usr/bin/timeout --signal=TERM --kill-after=2s 15s") < execute_section.index("/usr/bin/sudo -n /usr/bin/systemd-run") < execute_section.index("/usr/bin/env -i"),
     "smoke has outer job timeout": "timeout-minutes: 10" in smoke_job,
     "smoke receives no runtime credentials": all(value not in execute_section for value in ("ACTIONS_", "github.token", "GITHUB_TOKEN", "GH_TOKEN")),
-    "sandbox leaves runner-owned ancestry": "mktemp -d /var/tmp/go-candidate-smoke.XXXXXX" in smoke_job and 'install -o "$smoke_user"' in smoke_job,
+    "sandbox is rooted under run": "mktemp -d /run/go-candidate-smoke.XXXXXX" in smoke_job and 'install -o "$smoke_user"' in smoke_job,
     "preparation cleanup is armed then disarmed": "trap cleanup_preparation EXIT" in smoke_job and "trap - EXIT" in smoke_job,
-    "smoke always cleans sandbox and descendants": "trap cleanup_sandbox EXIT" in execute_section and "/usr/bin/pkill -KILL -u nobody" in execute_section,
+    "smoke cleanup is systemd-only": "trap cleanup_sandbox EXIT" in execute_section and "/usr/bin/systemctl kill" in execute_section and "/usr/bin/pkill" not in text,
+    "systemd containment properties present": all(value in execute_section for value in ("KillMode=control-group", "NoNewPrivileges=yes", "ProtectSystem=strict", "PrivateNetwork=yes", "MemoryMax=512M", "TasksMax=64", "LimitFSIZE=1M")),
+    "candidate output is bounded": "candidate-bounded-capture.py" in execute_section and "limit = 1024 * 1024" in execute_section,
     "CI runs candidate tests on Ubuntu": "runs-on: ubuntu-latest" in ci_text and "bash scripts/test-go-candidate.sh" in ci_text,
 }
 uses = re.findall(r"(?m)^\s*uses:\s*([^\s#]+)", text)

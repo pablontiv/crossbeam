@@ -94,8 +94,11 @@ jobs:
           if not re.fullmatch(r"[1-9][0-9]*", os.environ["PR_NUMBER"]):
               errors.append("pr-number must be a positive integer")
           binary = os.environ["BINARY_NAME"]
-          if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", binary) or binary.startswith("."):
-              errors.append("binary-name must be a non-hidden basename")
+          windows_devices = {"CON", "PRN", "AUX", "NUL", *(f"COM{number}" for number in range(1, 10)), *(f"LPT{number}" for number in range(1, 10))}
+          if (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", binary)
+                  or binary.endswith((".", " ")) or binary.split(".", 1)[0].upper() in windows_devices
+                  or binary.casefold() in {"candidate.json", "artifacts.json", "metadata.json", "checksums.txt"}):
+              errors.append("binary-name must be a portable non-reserved basename")
           if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", os.environ["GO_VERSION"]):
               errors.append("go-version must be an exact patch version")
           config = os.environ["GORELEASER_CONFIG"]
@@ -362,6 +365,7 @@ jobs:
           import json
           import os
           from pathlib import Path, PurePosixPath
+          import re
           import shutil
           import stat
 
@@ -370,9 +374,20 @@ jobs:
           if dist.is_symlink() or not dist.is_dir():
               raise SystemExit("::error::dist must be a real directory")
 
+          windows_devices = {"CON", "PRN", "AUX", "NUL", *(f"COM{number}" for number in range(1, 10)), *(f"LPT{number}" for number in range(1, 10))}
+
+          def portable_basename(value):
+              if (not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", value)
+                      or value.endswith((".", " ")) or value.split(".", 1)[0].upper() in windows_devices):
+                  raise SystemExit("::error::artifact basename is not portable")
+              return value
+
           def safe_file(raw, maximum):
               if not isinstance(raw, str) or not raw or Path(raw).is_absolute() or "\\" in raw:
                   raise SystemExit("::error::unsafe dist path")
+              basename = portable_basename(raw.removeprefix("dist/"))
+              if raw != f"dist/{basename}":
+                  raise SystemExit("::error::declared path must be literal dist/basename")
               path = workspace / "source" / raw
               try:
                   path.relative_to(dist)
@@ -411,10 +426,13 @@ jobs:
               safe_file(item.get("path"), 4 * 1024 * 1024 if item.get("type") == "Checksum" else 256 * 1024 * 1024)
               for item in selected
           ]
-          declared_names = [path.name for path in selected_files]
+          declared_names = [portable_basename(path.name) for path in selected_files]
           reserved = {"candidate.json", "artifacts.json", "metadata.json"}
-          if (len(declared_names) != 7 or len({name.casefold() for name in declared_names}) != len(declared_names)
-                  or {name.casefold() for name in declared_names} & reserved):
+          collision_keys = {name.rstrip(" .").casefold() for name in declared_names}
+          if (checksum_path := checksums[0].get("path")) != "dist/checksums.txt":
+              raise SystemExit("::error::checksum path must be exactly dist/checksums.txt")
+          if (len(declared_names) != 7 or len(collision_keys) != len(declared_names)
+                  or collision_keys & reserved):
               raise SystemExit("::error::declared archive/checksum basenames collide or are reserved")
           files = [artifacts_path, metadata_path, *selected_files]
           if len(files) != 9 or len({path.name.casefold() for path in files}) != len(files):
@@ -534,10 +552,21 @@ jobs:
           if len(archives) != len(EXPECTED_MATRIX) or len(checksum_items) != 1:
               raise SystemExit("::error::invalid six-target archive/checksum inventory")
 
+          windows_devices = {"CON", "PRN", "AUX", "NUL", *(f"COM{number}" for number in range(1, 10)), *(f"LPT{number}" for number in range(1, 10))}
+
+          def portable_basename(value):
+              if (not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", value)
+                      or value.endswith((".", " ")) or value.split(".", 1)[0].upper() in windows_devices):
+                  raise SystemExit("::error::artifact basename is not portable")
+              return value
+
           def raw_path(item, maximum):
               raw = item.get("path")
               if not isinstance(raw, str) or Path(raw).is_absolute() or "\\" in raw:
                   raise SystemExit("::error::unsafe artifact path")
+              basename = portable_basename(raw.removeprefix("dist/"))
+              if raw != f"dist/{basename}":
+                  raise SystemExit("::error::artifact path must be literal dist/basename")
               parts = PurePosixPath(raw).parts
               if len(parts) != 2 or parts[0] != "dist" or "/".join(parts) != raw or any(
                       part in ("", ".", "..") or part.startswith(".") for part in parts):
@@ -546,10 +575,13 @@ jobs:
 
           archive_paths = [(item, raw_path(item, MAX_ARCHIVE)) for item in archives]
           checksum_path = raw_path(checksum_items[0], MAX_CONTROL)
-          declared_names = [path.name for _, path in archive_paths] + [checksum_path.name]
+          declared_names = [portable_basename(path.name) for _, path in archive_paths] + [portable_basename(checksum_path.name)]
           reserved = {"candidate.json", "artifacts.json", "metadata.json"}
-          if (len(declared_names) != 7 or len({name.casefold() for name in declared_names}) != len(declared_names)
-                  or {name.casefold() for name in declared_names} & reserved):
+          collision_keys = {name.rstrip(" .").casefold() for name in declared_names}
+          if checksum_items[0].get("path") != "dist/checksums.txt":
+              raise SystemExit("::error::checksum path must be exactly dist/checksums.txt")
+          if (len(declared_names) != 7 or len(collision_keys) != len(declared_names)
+                  or collision_keys & reserved):
               raise SystemExit("::error::declared raw basenames collide or are reserved")
           expected_files = ["artifacts.json", "metadata.json", *declared_names]
           actual_entries = list(dist.iterdir())
@@ -587,10 +619,10 @@ jobs:
               if not name or name.startswith("/") or "\\" in name or any(ord(char) < 32 or ord(char) > 126 for char in name):
                   raise SystemExit("::error::archive member path must be relative printable ASCII")
               parts = PurePosixPath(name).parts
-              if "/".join(parts) != name or any(
-                      part in ("", ".", "..") or part.startswith(".")
-                      or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", part) for part in parts):
+              if "/".join(parts) != name or any(part in ("", ".", "..") or part.startswith(".") for part in parts):
                   raise SystemExit("::error::archive member path is noncanonical, hidden, traversing, or unsafe")
+              for part in parts:
+                  portable_basename(part)
               return parts
 
           def validate_document_path(parts):
@@ -624,7 +656,7 @@ jobs:
               binary_aliases = {os.environ["BINARY_NAME"], f"{os.environ['BINARY_NAME']}.exe"}
               for name, size, compressed, mode, key in records:
                   parts = safe_member_name(name)
-                  folded = name.casefold()
+                  folded = "/".join(part.rstrip(" .").casefold() for part in parts)
                   if folded in seen:
                       raise SystemExit("::error::duplicate or casefold-colliding archive member")
                   seen.add(folded)
@@ -793,7 +825,7 @@ jobs:
                           if prefix:
                               name = f"{prefix}/{name}"
                           parts = safe_member_name(name)
-                          folded = name.casefold()
+                          folded = "/".join(part.rstrip(" .").casefold() for part in parts)
                           if folded in seen:
                               raise SystemExit("::error::duplicate or casefold-colliding TAR member")
                           seen.add(folded)
@@ -1046,8 +1078,8 @@ jobs:
             status=$?
             trap - EXIT
             rm -f "${staged_binary:-}" "$RUNNER_TEMP/candidate-smoke-stage-path"
-            if [[ -n "${sandbox:-}" && "$sandbox" =~ ^/var/tmp/go-candidate-smoke\.[A-Za-z0-9]{6}$ ]]; then
-              if ! sudo -n rm -rf -- "$sandbox"; then
+            if [[ -n "${sandbox:-}" && "$sandbox" =~ ^/run/go-candidate-smoke\.[A-Za-z0-9]{6}$ ]]; then
+              if ! /usr/bin/sudo -n rm -rf -- "$sandbox"; then
                 exit 1
               fi
             fi
@@ -1056,23 +1088,42 @@ jobs:
           trap cleanup_preparation EXIT
           staged_binary=$(cat "$RUNNER_TEMP/candidate-smoke-stage-path")
           smoke_user=nobody
+          if [[ "$(cat /proc/1/comm)" != systemd ]] \
+            || [[ ! -x /usr/bin/sudo || ! -x /usr/bin/systemd-run || ! -x /usr/bin/systemctl \
+              || ! -x /usr/bin/timeout || ! -x /usr/bin/env ]] \
+            || ! id "$smoke_user" >/dev/null 2>&1 \
+            || ! /usr/bin/sudo -n true >/dev/null 2>&1; then
+            echo "::error::required systemd smoke isolation is unavailable"
+            exit 1
+          fi
           smoke_group=$(id -gn "$smoke_user")
-          sandbox=$(sudo -n mktemp -d /var/tmp/go-candidate-smoke.XXXXXX)
-          if [[ ! "$sandbox" =~ ^/var/tmp/go-candidate-smoke\.[A-Za-z0-9]{6}$ ]]; then
+          if [[ ! "$smoke_group" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+            echo "::error::nobody group is unsafe"
+            exit 1
+          fi
+          sandbox=$(/usr/bin/sudo -n mktemp -d /run/go-candidate-smoke.XXXXXX)
+          if [[ ! "$sandbox" =~ ^/run/go-candidate-smoke\.[A-Za-z0-9]{6}$ ]]; then
             echo "::error::mktemp returned an unexpected smoke sandbox path"
             exit 1
           fi
-          sudo -n chown root:root "$sandbox"
-          sudo -n chmod 0711 "$sandbox"
+          /usr/bin/sudo -n chown root:root "$sandbox"
+          /usr/bin/sudo -n chmod 0711 "$sandbox"
           for name in home tmp config cache data state db work; do
-            sudo -n install -d -o "$smoke_user" -g "$smoke_group" -m 0700 "$sandbox/$name"
+            /usr/bin/sudo -n install -d -o "$smoke_user" -g "$smoke_group" -m 0700 "$sandbox/$name"
           done
-          sudo -n install -o "$smoke_user" -g "$smoke_group" -m 0500 \
+          /usr/bin/sudo -n install -o "$smoke_user" -g "$smoke_group" -m 0500 \
             "$staged_binary" "$sandbox/candidate"
           rm -f "$staged_binary" "$RUNNER_TEMP/candidate-smoke-stage-path"
+          unit="go-candidate-smoke-$(tr -d '-' < /proc/sys/kernel/random/uuid)"
+          if [[ ! "$unit" =~ ^go-candidate-smoke-[a-f0-9]{32}$ ]]; then
+            echo "::error::generated systemd unit name is invalid"
+            exit 1
+          fi
           {
             echo "sandbox=$sandbox"
             echo "binary=$sandbox/candidate"
+            echo "unit=$unit"
+            echo "group=$smoke_group"
           } >> "$GITHUB_OUTPUT"
           trap - EXIT
 
@@ -1080,41 +1131,123 @@ jobs:
         env:
           SANDBOX: ${{ steps.extract.outputs.sandbox }}
           SMOKE_BINARY: ${{ steps.extract.outputs.binary }}
+          SMOKE_UNIT: ${{ steps.extract.outputs.unit }}
+          SMOKE_GROUP: ${{ steps.extract.outputs.group }}
           CANDIDATE_VERSION: ${{ needs.metadata.outputs.candidate-version }}
         run: |
-          if [[ ! "$SANDBOX" =~ ^/var/tmp/go-candidate-smoke\.[A-Za-z0-9]{6}$ ]] \
-            || [[ "$SMOKE_BINARY" != "$SANDBOX/candidate" ]]; then
-            echo "::error::smoke sandbox or binary path is invalid"
+          if [[ ! "$SANDBOX" =~ ^/run/go-candidate-smoke\.[A-Za-z0-9]{6}$ ]] \
+            || [[ "$SMOKE_BINARY" != "$SANDBOX/candidate" ]] \
+            || [[ ! "$SMOKE_UNIT" =~ ^go-candidate-smoke-[a-f0-9]{32}$ ]] \
+            || [[ ! "$SMOKE_GROUP" =~ ^[a-z_][a-z0-9_-]*$ ]]; then
+            echo "::error::smoke sandbox, unit, group, or binary path is invalid"
             exit 1
           fi
           cleanup_sandbox() {
             status=$?
             trap - EXIT
-            sudo -n /usr/bin/pkill -KILL -u nobody -f -- "$SANDBOX" 2>/dev/null || true
-            if ! sudo -n rm -rf -- "$SANDBOX"; then
+            cleanup_failed=false
+            load_state=$(/usr/bin/timeout --signal=KILL 5s /usr/bin/sudo -n \
+              /usr/bin/systemctl show --property=LoadState --value "$SMOKE_UNIT" 2>/dev/null) \
+              || cleanup_failed=true
+            if [[ "$load_state" != not-found ]]; then
+              /usr/bin/timeout --signal=KILL 5s /usr/bin/sudo -n \
+                /usr/bin/systemctl kill --kill-whom=all --signal=KILL "$SMOKE_UNIT" >/dev/null 2>&1 || true
+              /usr/bin/timeout --signal=KILL 5s /usr/bin/sudo -n \
+                /usr/bin/systemctl stop "$SMOKE_UNIT" >/dev/null 2>&1 || true
+              /usr/bin/timeout --signal=KILL 5s /usr/bin/sudo -n \
+                /usr/bin/systemctl reset-failed "$SMOKE_UNIT" >/dev/null 2>&1 || true
+            fi
+            final_state=$(/usr/bin/timeout --signal=KILL 5s /usr/bin/sudo -n \
+              /usr/bin/systemctl show --property=LoadState --value "$SMOKE_UNIT" 2>/dev/null) \
+              || cleanup_failed=true
+            [[ "$final_state" == not-found ]] || cleanup_failed=true
+            /usr/bin/sudo -n rm -rf -- "$SANDBOX" || cleanup_failed=true
+            if [[ "$cleanup_failed" == true ]]; then
               exit 1
             fi
             exit "$status"
           }
           trap cleanup_sandbox EXIT
-          if [[ ! -d "$SANDBOX" || "$(stat -c '%U:%G:%a' "$SANDBOX")" != "root:root:711" ]] \
+          if [[ "$(cat /proc/1/comm)" != systemd ]] \
+            || [[ ! -x /usr/bin/systemd-run || ! -x /usr/bin/systemctl || ! -x /usr/bin/sudo \
+              || ! -x /usr/bin/timeout || ! -x /usr/bin/env ]] \
+            || [[ ! -d "$SANDBOX" || "$(stat -c '%U:%G:%a' "$SANDBOX")" != "root:root:711" ]] \
             || [[ ! -f "$SMOKE_BINARY" || -L "$SMOKE_BINARY" ]]; then
-            echo "::error::smoke sandbox ownership or binary is invalid"
+            echo "::error::required systemd smoke isolation is unavailable or invalid"
             exit 1
           fi
-          version_output=$(/usr/bin/timeout --signal=TERM --kill-after=2s 10s \
-            /usr/bin/sudo -n -u nobody -- /usr/bin/env -i \
-            HOME="$SANDBOX/home" \
-            TMPDIR="$SANDBOX/tmp" \
-            XDG_CONFIG_HOME="$SANDBOX/config" \
-            XDG_CACHE_HOME="$SANDBOX/cache" \
-            XDG_DATA_HOME="$SANDBOX/data" \
-            XDG_STATE_HOME="$SANDBOX/state" \
-            DATABASE_URL="sqlite:///$SANDBOX/db/candidate.db" \
-            USER=nobody \
-            LOGNAME=nobody \
-            /bin/sh -c "cd \"\$1\" && exec \"\$2\" --version" \
-            candidate-smoke "$SANDBOX/work" "$SMOKE_BINARY" 2>&1)
+          capture_script="$RUNNER_TEMP/candidate-bounded-capture.py"
+          capture_output="$RUNNER_TEMP/candidate-bounded-output.txt"
+          cat > "$capture_script" <<'PY'
+          import sys
+          limit = 1024 * 1024
+          written = 0
+          exceeded = False
+          with open(sys.argv[1], "wb") as output:
+              while True:
+                  chunk = sys.stdin.buffer.read(65536)
+                  if not chunk:
+                      break
+                  remaining = max(limit - written, 0)
+                  if remaining:
+                      output.write(chunk[:remaining])
+                      written += min(len(chunk), remaining)
+                  if len(chunk) > remaining:
+                      exceeded = True
+          raise SystemExit(73 if exceeded else 0)
+          PY
+          set +e
+          /usr/bin/timeout --signal=TERM --kill-after=2s 15s \
+            /usr/bin/sudo -n /usr/bin/systemd-run \
+              --unit="$SMOKE_UNIT" \
+              --wait --pipe --collect --service-type=exec \
+              --property=User=nobody \
+              --property=Group="$SMOKE_GROUP" \
+              --property=WorkingDirectory="$SANDBOX/work" \
+              --property=RuntimeMaxSec=10s \
+              --property=TimeoutStopSec=2s \
+              --property=KillMode=control-group \
+              --property=SendSIGKILL=yes \
+              --property=NoNewPrivileges=yes \
+              --property=PrivateTmp=yes \
+              --property=ProtectSystem=strict \
+              --property=ProtectHome=yes \
+              --property=RestrictSUIDSGID=yes \
+              --property=UMask=0077 \
+              --property=MemoryMax=512M \
+              --property=TasksMax=64 \
+              --property=CPUQuota=100% \
+              --property=LimitFSIZE=1M \
+              --property=PrivateNetwork=yes \
+              --property=ReadWritePaths="$SANDBOX/home" \
+              --property=ReadWritePaths="$SANDBOX/tmp" \
+              --property=ReadWritePaths="$SANDBOX/config" \
+              --property=ReadWritePaths="$SANDBOX/cache" \
+              --property=ReadWritePaths="$SANDBOX/data" \
+              --property=ReadWritePaths="$SANDBOX/state" \
+              --property=ReadWritePaths="$SANDBOX/db" \
+              --property=ReadWritePaths="$SANDBOX/work" \
+              /usr/bin/env -i \
+                HOME="$SANDBOX/home" \
+                TMPDIR="$SANDBOX/tmp" \
+                XDG_CONFIG_HOME="$SANDBOX/config" \
+                XDG_CACHE_HOME="$SANDBOX/cache" \
+                XDG_DATA_HOME="$SANDBOX/data" \
+                XDG_STATE_HOME="$SANDBOX/state" \
+                DATABASE_URL="sqlite:///$SANDBOX/db/candidate.db" \
+                USER=nobody \
+                LOGNAME=nobody \
+                "$SMOKE_BINARY" --version 2>&1 \
+            | python3 "$capture_script" "$capture_output"
+          pipeline_status=("${PIPESTATUS[@]}")
+          set -e
+          rm -f "$capture_script"
+          if (( pipeline_status[0] != 0 || pipeline_status[1] != 0 )); then
+            echo "::error::systemd candidate execution failed or exceeded output limit"
+            exit 1
+          fi
+          version_output=$(cat "$capture_output")
+          rm -f "$capture_output"
           if [[ "$version_output" != *"$CANDIDATE_VERSION"* ]] || [[ "${version_output,,}" == *dev* ]]; then
             echo "::error::isolated --version output is not the candidate version"
             exit 1
@@ -1183,8 +1316,19 @@ jobs:
                   or len(set(matrix)) != 6 or set(matrix) != expected_matrix or len(checksum_items) != 1):
               raise SystemExit("::error::invalid publish six-target scalar inventory")
 
+          windows_devices = {"CON", "PRN", "AUX", "NUL", *(f"COM{number}" for number in range(1, 10)), *(f"LPT{number}" for number in range(1, 10))}
+
+          def portable_basename(value):
+              if (not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", value)
+                      or value.endswith((".", " ")) or value.split(".", 1)[0].upper() in windows_devices):
+                  raise SystemExit("::error::publish basename is not portable")
+              return value
+
           def declared_path(item):
               raw = item.get("path")
+              basename = portable_basename(raw.removeprefix("dist/")) if isinstance(raw, str) else None
+              if raw != f"dist/{basename}":
+                  raise SystemExit("::error::publish path must be literal dist/basename")
               parts = PurePosixPath(raw).parts if isinstance(raw, str) else ()
               if (len(parts) != 2 or parts[0] != "dist" or "/".join(parts) != raw
                       or any(part in ("", ".", "..") or part.startswith(".") for part in parts)):
@@ -1193,10 +1337,13 @@ jobs:
 
           archive_paths = [(item, declared_path(item)) for item in archives]
           checksum_path = declared_path(checksum_items[0])
-          declared_names = [path.name for _, path in archive_paths] + [checksum_path.name]
+          declared_names = [portable_basename(path.name) for _, path in archive_paths] + [portable_basename(checksum_path.name)]
           reserved = {"candidate.json", "artifacts.json", "metadata.json"}
-          if (len(declared_names) != 7 or len({name.casefold() for name in declared_names}) != 7
-                  or {name.casefold() for name in declared_names} & reserved):
+          collision_keys = {name.rstrip(" .").casefold() for name in declared_names}
+          if checksum_items[0].get("path") != "dist/checksums.txt":
+              raise SystemExit("::error::publish checksum path must be exactly dist/checksums.txt")
+          if (len(declared_names) != 7 or len(collision_keys) != 7
+                  or collision_keys & reserved):
               raise SystemExit("::error::publish declared basenames collide or are reserved")
           expected = ["artifacts.json", "metadata.json", *declared_names]
           actual_entries = list(dist.iterdir())
@@ -1225,8 +1372,11 @@ jobs:
               raise SystemExit("::error::manifest base version scalar is invalid")
           if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-pr\.[1-9][0-9]*\.g[0-9a-f]{7}", candidate_version):
               raise SystemExit("::error::manifest candidate version scalar is invalid")
-          if not re.fullmatch(r"[1-9][0-9]*", pr_number) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", binary_name):
-              raise SystemExit("::error::manifest PR or binary scalar is invalid")
+          if not re.fullmatch(r"[1-9][0-9]*", pr_number):
+              raise SystemExit("::error::manifest PR scalar is invalid")
+          portable_basename(binary_name)
+          if binary_name.casefold() in {"candidate.json", "artifacts.json", "metadata.json", "checksums.txt"}:
+              raise SystemExit("::error::manifest binary scalar is reserved")
           metadata = json.loads(regular(dist / "metadata.json").read_text())
           if metadata.get("version") != os.environ["CANDIDATE_VERSION"] or str(metadata.get("commit", "")).lower() != os.environ["SOURCE_SHA"]:
               raise SystemExit("::error::publish metadata mismatch")
