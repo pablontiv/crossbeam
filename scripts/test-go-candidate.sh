@@ -164,9 +164,23 @@ git -C "$fixture_repo" add go.mod main.go
 git -C "$fixture_repo" commit -m "feat: fixture" >/dev/null
 fixture_sha=$(git -C "$fixture_repo" rev-parse HEAD)
 candidate_version="1.2.4-pr.42.g${fixture_sha:0:7}"
+binary_dir="$TEST_ROOT/binaries"
+mkdir -p "$binary_dir"
+for platform in linux_amd64 linux_arm64 darwin_amd64 darwin_arm64 windows_amd64 windows_arm64; do
+  goos=${platform%_*}
+  goarch=${platform#*_}
+  suffix=
+  [[ "$goos" == windows ]] && suffix=.exe
+  (
+    cd "$fixture_repo"
+    CGO_ENABLED=0 GOOS="$goos" GOARCH="$goarch" GOTOOLCHAIN=local \
+      go build -ldflags "-X main.version=$candidate_version" \
+      -o "$binary_dir/${platform}${suffix}"
+  )
+done
 (
   cd "$fixture_repo"
-  GOTOOLCHAIN=local go build -ldflags "-X main.version=$candidate_version" -o "$TEST_ROOT/tool"
+  GOTOOLCHAIN=local go build -ldflags "-X main.version=$candidate_version" -o "$TEST_ROOT/tool-host"
 )
 go_version=$(go env GOVERSION)
 go_version=${go_version#go}
@@ -174,53 +188,123 @@ go_version=${go_version#go}
 make_raw() {
   local dir=$1 mode=${2:-valid}
   mkdir -p "$dir/raw/dist"
-  python3 - "$TEST_ROOT/tool" "$dir/raw/dist/tool_linux_amd64.tar.gz" "$mode" <<'PY'
+  python3 - "$binary_dir" "$dir/raw/dist" "$mode" <<'PY'
 from pathlib import Path
+import hashlib
 import io
+import json
+import stat
 import sys
 import tarfile
-binary = Path(sys.argv[1]).read_bytes()
-out = sys.argv[2]
+import zipfile
+
+binaries = Path(sys.argv[1])
+dist = Path(sys.argv[2])
 mode = sys.argv[3]
-with tarfile.open(out, "w:gz") as bundle:
-    def regular(name, data=binary):
-        info = tarfile.TarInfo(name)
-        info.mode = 0o755
+platforms = [
+    ("linux", "amd64"), ("linux", "arm64"),
+    ("darwin", "amd64"), ("darwin", "arm64"),
+    ("windows", "amd64"), ("windows", "arm64"),
+]
+archives = []
+
+def binary_for(goos, goarch):
+    suffix = ".exe" if goos == "windows" else ""
+    override = None
+    if mode == "header-linux" and (goos, goarch) == ("linux", "amd64"):
+        override = ("linux", "arm64")
+    elif mode == "header-darwin" and (goos, goarch) == ("darwin", "amd64"):
+        override = ("darwin", "arm64")
+    elif mode == "header-windows" and (goos, goarch) == ("windows", "amd64"):
+        override = ("windows", "arm64")
+    actual_os, actual_arch = override or (goos, goarch)
+    actual_suffix = ".exe" if actual_os == "windows" else ""
+    return (binaries / f"{actual_os}_{actual_arch}{actual_suffix}").read_bytes()
+
+def add_tar(bundle, name, data=b"x", permissions=0o644, kind=tarfile.REGTYPE, link=""):
+    info = tarfile.TarInfo(name)
+    info.mode = permissions
+    info.type = kind
+    info.linkname = link
+    if kind == tarfile.REGTYPE:
         info.size = len(data)
         bundle.addfile(info, io.BytesIO(data))
-    if mode == "traversal": regular("../tool")
-    elif mode == "absolute": regular("/tool")
-    elif mode == "symlink":
-        info = tarfile.TarInfo("tool"); info.type = tarfile.SYMTYPE; info.linkname = "target"; bundle.addfile(info)
-    elif mode == "hardlink":
-        info = tarfile.TarInfo("tool"); info.type = tarfile.LNKTYPE; info.linkname = "target"; bundle.addfile(info)
-    elif mode == "device":
-        info = tarfile.TarInfo("tool"); info.type = tarfile.CHRTYPE; bundle.addfile(info)
-    elif mode == "hidden":
-        regular(".hidden", b"x"); regular("tool")
-    elif mode == "duplicate":
-        regular("tool"); regular("tool")
-    elif mode == "casefold":
-        regular("TOOL", b"x"); regular("tool")
-    elif mode == "entry-bomb":
-        for number in range(129): regular(f"file-{number}", b"")
-        regular("tool")
-    else: regular("tool")
+    else:
+        bundle.addfile(info)
+
+def add_zip(bundle, name, data=b"x", permissions=0o644, kind=stat.S_IFREG):
+    info = zipfile.ZipInfo(name)
+    info.create_system = 3
+    info.external_attr = (kind | permissions) << 16
+    bundle.writestr(info, data, compress_type=zipfile.ZIP_DEFLATED)
+
+for goos, goarch in platforms:
+    suffix = ".zip" if goos == "windows" else ".tar.gz"
+    archive_name = f"tool_{goos}_{goarch}{suffix}"
+    archive = dist / archive_name
+    expected_binary = "tool.exe" if goos == "windows" else "tool"
+    payload = binary_for(goos, goarch)
+    if goos == "windows":
+        with zipfile.ZipFile(archive, "w") as bundle:
+            binary_name = expected_binary
+            if mode == "windows-no-exe" and goarch == "amd64": binary_name = "tool"
+            if mode == "zip-dir" and goarch == "amd64": add_zip(bundle, "docs/", b"", 0o755, stat.S_IFDIR)
+            elif mode == "zip-symlink" and goarch == "amd64": add_zip(bundle, "link", b"target", 0o777, stat.S_IFLNK)
+            else:
+                add_zip(bundle, binary_name, payload, 0o755)
+                add_zip(bundle, "README.md", b"representative roadmapctl docs", 0o644)
+                if goarch == "arm64": add_zip(bundle, "docs/USAGE.md", b"nested regular docs", 0o644)
+    else:
+        with tarfile.open(archive, "w:gz") as bundle:
+            is_primary = (goos, goarch) == ("linux", "amd64")
+            if is_primary and mode == "traversal": add_tar(bundle, "../tool", payload, 0o755)
+            elif is_primary and mode == "absolute": add_tar(bundle, "/tool", payload, 0o755)
+            elif is_primary and mode == "backslash": add_tar(bundle, "bin\\tool", payload, 0o755)
+            elif is_primary and mode == "noncanonical": add_tar(bundle, "docs//USAGE.md", b"x", 0o644); add_tar(bundle, "tool", payload, 0o755)
+            elif is_primary and mode == "symlink": add_tar(bundle, "tool", kind=tarfile.SYMTYPE, permissions=0o777, link="target")
+            elif is_primary and mode == "hardlink": add_tar(bundle, "tool", kind=tarfile.LNKTYPE, permissions=0o777, link="target")
+            elif is_primary and mode == "device": add_tar(bundle, "tool", kind=tarfile.CHRTYPE, permissions=0o600)
+            elif is_primary and mode == "fifo": add_tar(bundle, "tool", kind=tarfile.FIFOTYPE, permissions=0o600)
+            elif is_primary and mode == "tar-dir": add_tar(bundle, "docs", kind=tarfile.DIRTYPE, permissions=0o755); add_tar(bundle, "tool", payload, 0o755)
+            elif is_primary and mode == "hidden": add_tar(bundle, ".hidden", b"x", 0o644); add_tar(bundle, "tool", payload, 0o755)
+            elif is_primary and mode == "duplicate": add_tar(bundle, "tool", payload, 0o755); add_tar(bundle, "tool", payload, 0o755)
+            elif is_primary and mode == "casefold": add_tar(bundle, "README.md", b"x", 0o644); add_tar(bundle, "readme.md", b"y", 0o644); add_tar(bundle, "tool", payload, 0o755)
+            elif is_primary and mode == "entry-bomb":
+                for number in range(129): add_tar(bundle, f"file-{number}", b"", 0o644)
+                add_tar(bundle, "tool", payload, 0o755)
+            elif is_primary and mode == "unix-exe": add_tar(bundle, "tool.exe", payload, 0o755)
+            elif is_primary and mode == "nested-binary": add_tar(bundle, "bin/tool", payload, 0o755)
+            elif is_primary and mode == "ambiguous-binary": add_tar(bundle, "tool", payload, 0o755); add_tar(bundle, "docs/tool.exe", payload, 0o755)
+            elif is_primary and mode == "binary-nonexec": add_tar(bundle, "tool", payload, 0o644)
+            elif is_primary and mode == "binary-world-write": add_tar(bundle, "tool", payload, 0o777)
+            elif is_primary and mode == "binary-setuid": add_tar(bundle, "tool", payload, 0o4755)
+            elif is_primary and mode == "docs-executable": add_tar(bundle, "tool", payload, 0o755); add_tar(bundle, "README.md", b"x", 0o755)
+            else:
+                add_tar(bundle, expected_binary, payload, 0o755)
+                docs = b"representative backscroll docs" if goos == "linux" else b"representative rootline docs"
+                add_tar(bundle, "LICENSE", docs, 0o644)
+                if goarch == "amd64": add_tar(bundle, "README.md", b"safe product documentation", 0o644)
+    archives.append({"type": "Archive", "name": archive_name, "path": f"dist/{archive_name}", "goos": goos, "goarch": goarch})
+
+checksum_lines = []
+for item in sorted(archives, key=lambda value: value["path"]):
+    archive = dist / Path(item["path"]).name
+    checksum_lines.append(f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {archive.name}")
+if mode == "checksum-mismatch": checksum_lines[0] = "0" * 64 + checksum_lines[0][64:]
+if mode == "checksum-extra": checksum_lines.append("0" * 64 + "  extra.tar.gz")
+if mode == "checksum-duplicate": checksum_lines.append(checksum_lines[0])
+(dist / "checksums.txt").write_text("\n".join(checksum_lines) + "\n")
+artifacts = archives + [{"type": "Checksum", "name": "checksums", "path": "dist/checksums.txt"}]
+if mode == "wrapper-shape": artifacts = {"artifacts": artifacts}
+(dist / "artifacts.json").write_text(json.dumps(artifacts))
+if mode == "config-extra": (dist / "config.yaml").write_text("should not be uploaded\n")
 PY
-  (
-    cd "$dir/raw/dist"
-    sha256sum tool_linux_amd64.tar.gz > checksums.txt
-  )
   python3 - "$dir" "$fixture_sha" "$candidate_version" <<'PY'
 import json
 from pathlib import Path
 import sys
 root = Path(sys.argv[1]) / "raw/dist"
 (root / "metadata.json").write_text(json.dumps({"commit": sys.argv[2], "version": sys.argv[3]}))
-(root / "artifacts.json").write_text(json.dumps({"artifacts": [
-    {"type": "Archive", "name": "tool", "path": "dist/tool_linux_amd64.tar.gz", "goos": "linux", "goarch": "amd64"},
-    {"type": "Checksum", "name": "checksums", "path": "dist/checksums.txt"},
-]}))
 PY
 }
 
@@ -233,22 +317,72 @@ run_static_case() {
     BINARY_NAME=tool GO_VERSION="$expected_go" \
     bash -c "cd '$dir' && '$TEST_ROOT/static.sh'"
 }
-run_static_case "valid archive passes without execution" valid success
+run_static_case "direct-list six-target TAR and ZIP archives pass" valid success
 run_static_case "archive traversal rejected" traversal failure
 run_static_case "absolute archive member rejected" absolute failure
+run_static_case "backslash archive member rejected" backslash failure
+run_static_case "noncanonical archive member rejected" noncanonical failure
 run_static_case "archive symlink rejected" symlink failure
 run_static_case "archive hardlink rejected" hardlink failure
 run_static_case "archive device rejected" device failure
+run_static_case "archive FIFO rejected" fifo failure
+run_static_case "archive TAR directory rejected" tar-dir failure
+run_static_case "archive ZIP symlink rejected" zip-symlink failure
+run_static_case "archive ZIP directory rejected" zip-dir failure
 run_static_case "hidden archive member rejected" hidden failure
 run_static_case "duplicate archive member rejected" duplicate failure
 run_static_case "casefold collision rejected" casefold failure
 run_static_case "archive entry bomb rejected" entry-bomb failure
-run_static_case "toolchain mismatch rejected" valid failure 0.0.1
+run_static_case "Unix exe suffix rejected" unix-exe failure
+run_static_case "Windows extensionless binary rejected" windows-no-exe failure
+run_static_case "nested binary rejected" nested-binary failure
+run_static_case "ambiguous platform binary copies rejected" ambiguous-binary failure
+run_static_case "non-executable binary rejected" binary-nonexec failure
+run_static_case "world-writable binary rejected" binary-world-write failure
+run_static_case "setuid binary rejected" binary-setuid failure
+run_static_case "executable documentation rejected" docs-executable failure
+run_static_case "checksum mismatch rejected" checksum-mismatch failure
+run_static_case "extra checksum rejected" checksum-extra failure
+run_static_case "duplicate checksum rejected" checksum-duplicate failure
+run_static_case "wrapped speculative artifacts shape rejected" wrapper-shape failure
+run_static_case "raw config and intermediates excluded" config-extra failure
+run_static_case "ELF architecture label mismatch rejected" header-linux failure
+run_static_case "Mach-O architecture label mismatch rejected" header-darwin failure
+run_static_case "PE architecture label mismatch rejected" header-windows failure
+run_static_case "exact compiler version rejects substring" valid failure "${go_version}0"
 
 echo ""
 echo "=== Isolated smoke and deterministic publication ==="
 smoke_dir="$TEST_ROOT/smoke-valid"
 make_raw "$smoke_dir" valid
+# Smoke execution must be host-native in local tests (macOS or Linux). Static
+# validation above independently verifies the real linux/amd64 ELF fixture.
+python3 - "$TEST_ROOT/tool-host" "$smoke_dir/raw/dist" <<'PY'
+from pathlib import Path
+import hashlib
+import io
+import sys
+import tarfile
+binary = Path(sys.argv[1]).read_bytes()
+dist = Path(sys.argv[2])
+archive = dist / "tool_linux_amd64.tar.gz"
+with tarfile.open(archive, "w:gz") as bundle:
+    info = tarfile.TarInfo("tool")
+    info.mode = 0o755
+    info.size = len(binary)
+    bundle.addfile(info, io.BytesIO(binary))
+    doc = tarfile.TarInfo("README.md")
+    doc.mode = 0o644
+    doc.size = 4
+    bundle.addfile(doc, io.BytesIO(b"docs"))
+lines = []
+for line in (dist / "checksums.txt").read_text().splitlines():
+    name = line.split("  ", 1)[1]
+    if name == archive.name:
+        line = f"{hashlib.sha256(archive.read_bytes()).hexdigest()}  {name}"
+    lines.append(line)
+(dist / "checksums.txt").write_text("\n".join(lines) + "\n")
+PY
 extract_output="$smoke_dir/extract-output"
 expect_status "safe smoke extraction succeeds" success "$smoke_dir/extract.log" \
   env BINARY_NAME=tool GITHUB_OUTPUT="$extract_output" \
@@ -275,16 +409,26 @@ expect_status "publish revalidation and manifest succeed" success "$smoke_dir/pu
   env SOURCE_SHA="$fixture_sha" BASE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb \
   BASE_VERSION=v1.2.3 CANDIDATE_VERSION="$candidate_version" PR_NUMBER=42 \
   GITHUB_OUTPUT="$publish_output" bash -c "cd '$smoke_dir' && '$TEST_ROOT/publish.sh'"
-published=$(find "$smoke_dir/candidate-upload" -maxdepth 1 -type f -exec basename {} \; | sort | tr '\n' ',')
-record "final allowlist is exact" "candidate.json,checksums.txt,tool_linux_amd64.tar.gz," "$published"
+published_count=$(find "$smoke_dir/candidate-upload" -maxdepth 1 -type f | wc -l | tr -d ' ')
+record "final allowlist contains six archives checksum and manifest" 8 "$published_count"
+for forbidden in artifacts.json metadata.json config.yaml; do
+  record "final excludes $forbidden" absent "$([[ -e "$smoke_dir/candidate-upload/$forbidden" ]] && echo present || echo absent)"
+done
 manifest_order=$(python3 - "$smoke_dir/candidate-upload/candidate.json" <<'PY'
 import json
 import sys
 value = json.load(open(sys.argv[1]))
-print("valid" if list(value) == sorted(value) and value["archives"] == sorted(value["archives"], key=lambda item: item["file"]) else "invalid")
+expected = {
+    ("linux", "amd64"), ("linux", "arm64"),
+    ("darwin", "amd64"), ("darwin", "arm64"),
+    ("windows", "amd64"), ("windows", "arm64"),
+}
+matrix = {(item["goos"], item["goarch"]) for item in value["archives"]}
+valid = list(value) == sorted(value) and value["archives"] == sorted(value["archives"], key=lambda item: item["file"]) and matrix == expected
+print("valid" if valid else "invalid")
 PY
 )
-record "manifest is deterministic" valid "$manifest_order"
+record "six-target manifest is deterministic" valid "$manifest_order"
 
 echo ""
 echo "=== DAG, permissions, artifact identity, and trusted inputs ==="

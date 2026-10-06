@@ -270,7 +270,7 @@ jobs:
           python3 - <<'PY'
           import json
           import os
-          from pathlib import Path
+          from pathlib import Path, PurePosixPath
           import shutil
           import stat
 
@@ -279,7 +279,7 @@ jobs:
           if dist.is_symlink() or not dist.is_dir():
               raise SystemExit("::error::dist must be a real directory")
 
-          def safe_file(raw):
+          def safe_file(raw, maximum):
               if not isinstance(raw, str) or not raw or Path(raw).is_absolute() or "\\" in raw:
                   raise SystemExit("::error::unsafe dist path")
               path = workspace / "source" / raw
@@ -287,28 +287,40 @@ jobs:
                   path.relative_to(dist)
               except ValueError:
                   raise SystemExit("::error::dist path escapes")
-              if any(part in ("", ".", "..") or part.startswith(".") for part in Path(raw).parts):
-                  raise SystemExit("::error::hidden or traversing dist path")
+              parts = PurePosixPath(raw).parts
+              if "/".join(parts) != raw or any(part in ("", ".", "..") or part.startswith(".") for part in parts):
+                  raise SystemExit("::error::hidden, traversing, or noncanonical dist path")
               if any(parent.is_symlink() for parent in [path, *path.parents] if parent != workspace.parent):
                   raise SystemExit("::error::dist path contains symlink")
               resolved = path.resolve(strict=True)
               resolved.relative_to(dist)
               if not stat.S_ISREG(resolved.stat(follow_symlinks=False).st_mode):
                   raise SystemExit("::error::dist path is not regular")
+              if resolved.stat().st_size > maximum:
+                  raise SystemExit("::error::dist path exceeds pre-upload size limit")
               return resolved
 
-          artifacts_path = safe_file("dist/artifacts.json")
-          metadata_path = safe_file("dist/metadata.json")
-          document = json.loads(artifacts_path.read_text())
-          artifacts = document.get("artifacts") if isinstance(document, dict) else document
+          artifacts_path = safe_file("dist/artifacts.json", 4 * 1024 * 1024)
+          metadata_path = safe_file("dist/metadata.json", 4 * 1024 * 1024)
+          artifacts = json.loads(artifacts_path.read_text())
           if not isinstance(artifacts, list) or not all(isinstance(item, dict) for item in artifacts):
               raise SystemExit("::error::invalid artifacts.json")
           selected = [item for item in artifacts if item.get("type") in ("Archive", "Checksum")]
           archives = [item for item in selected if item.get("type") == "Archive"]
           checksums = [item for item in selected if item.get("type") == "Checksum"]
-          if not 1 <= len(archives) <= 32 or len(checksums) != 1:
-              raise SystemExit("::error::raw artifact count is outside limits")
-          files = [artifacts_path, metadata_path, *(safe_file(item.get("path")) for item in selected)]
+          expected_matrix = {
+              ("linux", "amd64"), ("linux", "arm64"),
+              ("darwin", "amd64"), ("darwin", "arm64"),
+              ("windows", "amd64"), ("windows", "arm64"),
+          }
+          matrix = {(item.get("goos"), item.get("goarch")) for item in archives}
+          if len(archives) != 6 or matrix != expected_matrix or len(checksums) != 1:
+              raise SystemExit("::error::raw artifact inventory is not the six-target matrix")
+          selected_files = [
+              safe_file(item.get("path"), 4 * 1024 * 1024 if item.get("type") == "Checksum" else 256 * 1024 * 1024)
+              for item in selected
+          ]
+          files = [artifacts_path, metadata_path, *selected_files]
           if len({path.name.casefold() for path in files}) != len(files):
               raise SystemExit("::error::raw basenames collide")
           total = sum(path.stat().st_size for path in files)
@@ -369,6 +381,7 @@ jobs:
           from pathlib import Path, PurePosixPath
           import re
           import stat
+          import struct
           import subprocess
           import tarfile
           import tempfile
@@ -380,36 +393,45 @@ jobs:
               raise SystemExit("::error::raw dist must be a real directory")
           MAX_ENTRIES = 128
           MAX_MEMBER = 256 * 1024 * 1024
+          MAX_ARCHIVE = 256 * 1024 * 1024
           MAX_EXPANDED = 512 * 1024 * 1024
           MAX_RATIO = 200
+          MAX_CONTROL = 4 * 1024 * 1024
+          EXPECTED_MATRIX = {
+              ("linux", "amd64"), ("linux", "arm64"),
+              ("darwin", "amd64"), ("darwin", "arm64"),
+              ("windows", "amd64"), ("windows", "arm64"),
+          }
 
-          def regular(path):
+          def regular(path, maximum=None):
               if path.is_symlink() or not path.is_file() or not stat.S_ISREG(path.stat(follow_symlinks=False).st_mode):
                   raise SystemExit(f"::error::not a regular raw file: {path}")
+              if maximum is not None and path.stat().st_size > maximum:
+                  raise SystemExit(f"::error::raw file exceeds size limit: {path}")
               return path
 
-          artifacts_path = regular(dist / "artifacts.json")
-          metadata_path = regular(dist / "metadata.json")
-          document = json.loads(artifacts_path.read_text())
-          artifacts = document.get("artifacts") if isinstance(document, dict) else document
+          artifacts_path = regular(dist / "artifacts.json", MAX_CONTROL)
+          metadata_path = regular(dist / "metadata.json", MAX_CONTROL)
+          artifacts = json.loads(artifacts_path.read_text())
           if not isinstance(artifacts, list) or not all(isinstance(item, dict) for item in artifacts):
-              raise SystemExit("::error::invalid artifacts.json")
+              raise SystemExit("::error::artifacts.json must use GoReleaser's direct-list shape")
           archives = [item for item in artifacts if item.get("type") == "Archive"]
           checksum_items = [item for item in artifacts if item.get("type") == "Checksum"]
-          if not 1 <= len(archives) <= 32 or len(checksum_items) != 1:
-              raise SystemExit("::error::invalid archive/checksum inventory")
+          if len(archives) != len(EXPECTED_MATRIX) or len(checksum_items) != 1:
+              raise SystemExit("::error::invalid six-target archive/checksum inventory")
 
-          def raw_path(item):
+          def raw_path(item, maximum):
               raw = item.get("path")
               if not isinstance(raw, str) or Path(raw).is_absolute() or "\\" in raw:
                   raise SystemExit("::error::unsafe artifact path")
               parts = PurePosixPath(raw).parts
-              if len(parts) != 2 or parts[0] != "dist" or any(part in ("", ".", "..") or part.startswith(".") for part in parts):
-                  raise SystemExit("::error::artifact path must be dist/non-hidden-basename")
-              return regular(root / Path(*parts))
+              if len(parts) != 2 or parts[0] != "dist" or "/".join(parts) != raw or any(
+                      part in ("", ".", "..") or part.startswith(".") for part in parts):
+                  raise SystemExit("::error::artifact path must be canonical dist/non-hidden-basename")
+              return regular(root / Path(*parts), maximum)
 
-          archive_paths = [(item, raw_path(item)) for item in archives]
-          checksum_path = raw_path(checksum_items[0])
+          archive_paths = [(item, raw_path(item, MAX_ARCHIVE)) for item in archives]
+          checksum_path = raw_path(checksum_items[0], MAX_CONTROL)
           expected_files = {"artifacts.json", "metadata.json", checksum_path.name, *(path.name for _, path in archive_paths)}
           actual_files = {path.name for path in dist.iterdir() if path.is_file() and not path.is_symlink()}
           if actual_files != expected_files or len(list(dist.iterdir())) != len(expected_files):
@@ -424,6 +446,8 @@ jobs:
                   raise SystemExit("::error::invalid or duplicate checksum")
               checksums[match.group(2)] = match.group(1).lower()
           archive_names = {path.name for _, path in archive_paths}
+          if len(archive_names) != len(archive_paths):
+              raise SystemExit("::error::declared archive paths are duplicated")
           if set(checksums) != archive_names:
               raise SystemExit("::error::checksums do not map one-to-one to archives")
 
@@ -433,77 +457,162 @@ jobs:
           if str(metadata.get("commit", "")).lower() != os.environ["SOURCE_SHA"]:
               raise SystemExit("::error::candidate metadata commit mismatch")
 
+          def stream_sha256(path):
+              digest = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
           def safe_member_name(name):
               if not name or name.startswith("/") or "\\" in name or any(ord(char) < 32 or ord(char) > 126 for char in name):
                   raise SystemExit("::error::archive member path must be relative printable ASCII")
               parts = PurePosixPath(name).parts
-              if any(part in ("", ".", "..") or part.startswith(".")
-                     or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", part) for part in parts):
-                  raise SystemExit("::error::archive member is hidden, traversing, or unsafe")
+              if "/".join(parts) != name or any(
+                      part in ("", ".", "..") or part.startswith(".")
+                      or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", part) for part in parts):
+                  raise SystemExit("::error::archive member path is noncanonical, hidden, traversing, or unsafe")
               return parts
 
-          matrix = set()
-          for item, archive in sorted(archive_paths, key=lambda pair: pair[1].name):
-              if hashlib.sha256(archive.read_bytes()).hexdigest() != checksums[archive.name]:
-                  raise SystemExit("::error::archive checksum mismatch")
-              platform = (item.get("goos"), item.get("goarch"))
-              if not all(isinstance(value, str) and re.fullmatch(r"[a-z0-9]+", value) for value in platform) or platform in matrix:
-                  raise SystemExit("::error::invalid or duplicate platform matrix entry")
-              matrix.add(platform)
-              members = []
-              expanded = 0
-              if zipfile.is_zipfile(archive):
-                  with zipfile.ZipFile(archive) as bundle:
-                      for info in bundle.infolist():
-                          mode = info.external_attr >> 16
-                          if info.is_dir() or (mode and not stat.S_ISREG(mode)) or info.flag_bits & 1:
-                              raise SystemExit("::error::zip contains non-regular or encrypted member")
-                          members.append((info.filename, info.file_size, info.compress_size, lambda value=info: bundle.read(value)))
-                      member_data = [(name, size, compressed, reader()) for name, size, compressed, reader in members]
-              elif tarfile.is_tarfile(archive):
-                  with tarfile.open(archive, "r:*") as bundle:
-                      for member in bundle.getmembers():
-                          if not member.isfile():
-                              raise SystemExit("::error::tar contains link, directory, device, or other non-regular member")
-                          extracted = bundle.extractfile(member)
-                          if extracted is None:
-                              raise SystemExit("::error::tar member cannot be read")
-                          members.append((member.name, member.size, archive.stat().st_size, extracted.read()))
-                      member_data = members
-              else:
-                  raise SystemExit("::error::unsupported archive format")
-              if not 1 <= len(member_data) <= MAX_ENTRIES:
+          def validate_members(records, archive_size, expected_binary):
+              if not 1 <= len(records) <= MAX_ENTRIES:
                   raise SystemExit("::error::archive entry limit exceeded")
               seen = set()
-              binaries = []
-              for name, size, compressed, data in member_data:
+              expanded = 0
+              binary_key = None
+              binary_size = None
+              binary_aliases = {os.environ["BINARY_NAME"], f"{os.environ['BINARY_NAME']}.exe"}
+              for name, size, compressed, mode, key in records:
                   parts = safe_member_name(name)
                   folded = name.casefold()
                   if folded in seen:
                       raise SystemExit("::error::duplicate or casefold-colliding archive member")
                   seen.add(folded)
-                  if size != len(data) or size > MAX_MEMBER:
+                  if size < 0 or size > MAX_MEMBER:
                       raise SystemExit("::error::archive member size limit exceeded")
                   expanded += size
-                  if (size and compressed <= 0) or (compressed > 0 and size > compressed * MAX_RATIO):
-                      raise SystemExit("::error::archive compression ratio limit exceeded")
-                  if parts[-1] == os.environ["BINARY_NAME"]:
-                      binaries.append(data)
-              if expanded > MAX_EXPANDED or expanded > max(archive.stat().st_size, 1) * MAX_RATIO:
-                  raise SystemExit("::error::archive expanded size limit exceeded")
-              if len(binaries) != 1:
-                  raise SystemExit("::error::archive must contain binary-name exactly once")
+                  if compressed is not None and ((size and compressed <= 0) or (compressed > 0 and size > compressed * MAX_RATIO)):
+                      raise SystemExit("::error::archive member compression ratio limit exceeded")
+                  permissions = mode & 0o7777
+                  is_binary = parts[-1] in binary_aliases
+                  if permissions & 0o7022:
+                      raise SystemExit("::error::archive member has unsafe mode")
+                  if is_binary:
+                      if len(parts) != 1 or name != expected_binary or binary_key is not None:
+                          raise SystemExit("::error::binary name, platform extension, root path, or uniqueness mismatch")
+                      if not permissions & 0o111:
+                          raise SystemExit("::error::binary is not executable")
+                      binary_key = key
+                      binary_size = size
+                  elif permissions & 0o111:
+                      raise SystemExit("::error::documentation member must not be executable")
+              if expanded > MAX_EXPANDED or expanded > max(archive_size, 1) * MAX_RATIO:
+                  raise SystemExit("::error::archive expanded size or ratio limit exceeded")
+              if binary_key is None:
+                  raise SystemExit("::error::archive lacks its exact root platform binary")
+              return binary_key, binary_size
+
+          def read_bounded(stream, expected_size):
+              chunks = []
+              total = 0
+              while True:
+                  chunk = stream.read(min(1024 * 1024, MAX_MEMBER + 1 - total))
+                  if not chunk:
+                      break
+                  chunks.append(chunk)
+                  total += len(chunk)
+                  if total > expected_size or total > MAX_MEMBER:
+                      raise SystemExit("::error::binary payload exceeds bounded metadata")
+              if total != expected_size:
+                  raise SystemExit("::error::binary payload size differs from metadata")
+              return b"".join(chunks)
+
+          def validate_executable_header(data, platform):
+              goos, goarch = platform
+              if goos == "linux":
+                  if len(data) < 20 or data[:4] != b"\x7fELF" or data[5] not in (1, 2):
+                      raise SystemExit("::error::Linux binary lacks a valid ELF header")
+                  endian = "<" if data[5] == 1 else ">"
+                  machine = struct.unpack_from(f"{endian}H", data, 18)[0]
+                  expected = {"amd64": 62, "arm64": 183}[goarch]
+              elif goos == "darwin":
+                  if len(data) < 8 or data[:4] not in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf"):
+                      raise SystemExit("::error::Darwin binary lacks a valid 64-bit Mach-O header")
+                  endian = "<" if data[:4] == b"\xcf\xfa\xed\xfe" else ">"
+                  machine = struct.unpack_from(f"{endian}I", data, 4)[0]
+                  expected = {"amd64": 0x01000007, "arm64": 0x0100000C}[goarch]
+              else:
+                  if len(data) < 64 or data[:2] != b"MZ":
+                      raise SystemExit("::error::Windows binary lacks a valid PE header")
+                  pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
+                  if pe_offset + 6 > len(data) or data[pe_offset:pe_offset + 4] != b"PE\x00\x00":
+                      raise SystemExit("::error::Windows binary has an invalid PE offset")
+                  machine = struct.unpack_from("<H", data, pe_offset + 4)[0]
+                  expected = {"amd64": 0x8664, "arm64": 0xAA64}[goarch]
+              if machine != expected:
+                  raise SystemExit("::error::executable header does not match declared platform architecture")
+
+          matrix = set()
+          for item, archive in sorted(archive_paths, key=lambda pair: pair[1].name):
+              if stream_sha256(archive) != checksums[archive.name]:
+                  raise SystemExit("::error::archive checksum mismatch")
+              platform = (item.get("goos"), item.get("goarch"))
+              if platform not in EXPECTED_MATRIX or platform in matrix:
+                  raise SystemExit("::error::invalid or duplicate six-target platform matrix entry")
+              matrix.add(platform)
+              expected_binary = f"{os.environ['BINARY_NAME']}.exe" if platform[0] == "windows" else os.environ["BINARY_NAME"]
+              archive_size = archive.stat().st_size
+              binary_data = None
+              if platform[0] == "windows":
+                  if not zipfile.is_zipfile(archive):
+                      raise SystemExit("::error::Windows archive must be ZIP")
+                  with zipfile.ZipFile(archive) as bundle:
+                      infos = bundle.infolist()
+                      if not 1 <= len(infos) <= MAX_ENTRIES:
+                          raise SystemExit("::error::archive entry limit exceeded before payload read")
+                      records = []
+                      for index, info in enumerate(infos):
+                          mode = info.external_attr >> 16
+                          file_type = stat.S_IFMT(mode)
+                          if info.is_dir() or file_type not in (0, stat.S_IFREG) or info.flag_bits & 1:
+                              raise SystemExit("::error::zip contains directory, link, special, or encrypted member")
+                          records.append((info.filename, info.file_size, info.compress_size, mode, index))
+                      binary_index, binary_size = validate_members(records, archive_size, expected_binary)
+                      with bundle.open(infos[binary_index]) as stream:
+                          binary_data = read_bounded(stream, binary_size)
+              else:
+                  if not tarfile.is_tarfile(archive):
+                      raise SystemExit("::error::Unix archive must be TAR")
+                  with tarfile.open(archive, "r:*") as bundle:
+                      members = []
+                      records = []
+                      for member in bundle:
+                          if len(members) >= MAX_ENTRIES:
+                              raise SystemExit("::error::archive entry limit exceeded before payload read")
+                          if not member.isfile():
+                              raise SystemExit("::error::tar contains directory, link, device, FIFO, or other non-regular member")
+                          records.append((member.name, member.size, None, member.mode, len(members)))
+                          members.append(member)
+                      binary_index, binary_size = validate_members(records, archive_size, expected_binary)
+                      stream = bundle.extractfile(members[binary_index])
+                      if stream is None:
+                          raise SystemExit("::error::binary member cannot be read")
+                      binary_data = read_bounded(stream, binary_size)
+              if len(binary_data) != binary_size:
+                  raise SystemExit("::error::binary payload size differs from bounded metadata")
+              validate_executable_header(binary_data, platform)
               with tempfile.NamedTemporaryFile() as binary:
-                  binary.write(binaries[0])
+                  binary.write(binary_data)
                   binary.flush()
                   result = subprocess.run(["go", "version", "-m", binary.name], check=True, text=True, capture_output=True)
-              if f"go{os.environ['GO_VERSION']}" not in result.stdout:
-                  raise SystemExit("::error::binary Go toolchain mismatch")
+              compiler = re.search(r":\s+(go[0-9]+\.[0-9]+\.[0-9]+)\s*$", result.stdout.splitlines()[0])
+              if not compiler or compiler.group(1) != f"go{os.environ['GO_VERSION']}":
+                  raise SystemExit("::error::binary Go compiler version is not an exact match")
               revisions = re.findall(r"(?m)^\s*build\s+vcs\.revision=(\S+)\s*$", result.stdout)
               if revisions != [os.environ["SOURCE_SHA"]]:
                   raise SystemExit("::error::binary revision mismatch")
-          if ("linux", "amd64") not in matrix:
-              raise SystemExit("::error::platform matrix lacks linux/amd64")
+          if matrix != EXPECTED_MATRIX:
+              raise SystemExit("::error::declared archives do not form the required six-target matrix")
           PY
 
   smoke:
@@ -531,14 +640,14 @@ jobs:
           import stat
           import tarfile
           import tempfile
-          import zipfile
 
           root = Path("raw").resolve()
           dist = root / "dist"
           if dist.is_symlink() or not dist.is_dir():
               raise SystemExit("::error::raw dist must be a real directory")
           artifacts = json.loads((dist / "artifacts.json").read_text())
-          artifacts = artifacts.get("artifacts") if isinstance(artifacts, dict) else artifacts
+          if not isinstance(artifacts, list) or not all(isinstance(item, dict) for item in artifacts):
+              raise SystemExit("::error::invalid direct-list artifacts.json")
           matches = [item for item in artifacts if item.get("type") == "Archive" and item.get("goos") == "linux" and item.get("goarch") == "amd64"]
           if len(matches) != 1:
               raise SystemExit("::error::expected one linux/amd64 archive")
@@ -547,22 +656,31 @@ jobs:
           if len(parts) != 2 or parts[0] != "dist" or any(part in ("", ".", "..") or part.startswith(".") for part in parts):
               raise SystemExit("::error::unsafe smoke archive path")
           archive = root / Path(*parts)
+          if not tarfile.is_tarfile(archive):
+              raise SystemExit("::error::linux/amd64 smoke archive must be TAR")
           payloads = []
-          if zipfile.is_zipfile(archive):
-              with zipfile.ZipFile(archive) as bundle:
-                  for info in bundle.infolist():
-                      mode = info.external_attr >> 16
-                      if PurePosixPath(info.filename).name == os.environ["BINARY_NAME"] and not info.is_dir() and (not mode or stat.S_ISREG(mode)):
-                          payloads.append(bundle.read(info))
-          elif tarfile.is_tarfile(archive):
-              with tarfile.open(archive, "r:*") as bundle:
-                  for member in bundle.getmembers():
-                      if PurePosixPath(member.name).name == os.environ["BINARY_NAME"] and member.isfile():
-                          stream = bundle.extractfile(member)
-                          if stream is not None:
-                              payloads.append(stream.read())
+          with tarfile.open(archive, "r:*") as bundle:
+              for member in bundle.getmembers():
+                  if member.name == os.environ["BINARY_NAME"] and member.isfile():
+                      if member.size > 256 * 1024 * 1024 or not member.mode & 0o111 or member.mode & 0o7022:
+                          raise SystemExit("::error::smoke binary metadata is unsafe")
+                      stream = bundle.extractfile(member)
+                      if stream is not None:
+                          chunks = []
+                          total = 0
+                          while True:
+                              chunk = stream.read(min(1024 * 1024, member.size + 1 - total))
+                              if not chunk:
+                                  break
+                              chunks.append(chunk)
+                              total += len(chunk)
+                              if total > member.size:
+                                  raise SystemExit("::error::smoke binary exceeds declared size")
+                          if total != member.size:
+                              raise SystemExit("::error::smoke binary size mismatch")
+                          payloads.append(b"".join(chunks))
           if len(payloads) != 1:
-              raise SystemExit("::error::smoke binary is absent or ambiguous")
+              raise SystemExit("::error::exact root smoke binary is absent or ambiguous")
           sandbox = Path(tempfile.mkdtemp(prefix="candidate-smoke-"))
           binary = sandbox / "candidate"
           binary.write_bytes(payloads[0])
@@ -641,8 +759,7 @@ jobs:
                   raise SystemExit("::error::publish input is not regular")
               return path
 
-          document = json.loads(regular(dist / "artifacts.json").read_text())
-          artifacts = document.get("artifacts") if isinstance(document, dict) else document
+          artifacts = json.loads(regular(dist / "artifacts.json").read_text())
           if not isinstance(artifacts, list) or not all(isinstance(item, dict) for item in artifacts):
               raise SystemExit("::error::invalid artifacts.json")
           archives = [item for item in artifacts if item.get("type") == "Archive"]
@@ -675,9 +792,16 @@ jobs:
           if metadata.get("version") != os.environ["CANDIDATE_VERSION"] or str(metadata.get("commit", "")).lower() != os.environ["SOURCE_SHA"]:
               raise SystemExit("::error::publish metadata mismatch")
 
+          def stream_sha256(path):
+              digest = hashlib.sha256()
+              with path.open("rb") as stream:
+                  for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+                      digest.update(chunk)
+              return digest.hexdigest()
+
           manifest_archives = []
           for item, path in sorted(archive_paths, key=lambda pair: pair[1].name):
-              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              digest = stream_sha256(path)
               if checksums.get(path.name) != digest:
                   raise SystemExit("::error::publish archive checksum mismatch")
               manifest_archives.append({

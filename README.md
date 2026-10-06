@@ -249,7 +249,7 @@ The workflow isolates trust boundaries across fresh jobs:
 
 1. `metadata` reads only the PR API and the public caller Git graph.
 2. `build` has no repository permission, installs the exact Go toolchain and GoReleaser before fetching source, uses only the base-SHA GoReleaser config, and uploads one bounded raw artifact.
-3. `static-validate` downloads that exact artifact ID and inspects metadata, checksums, platform matrix, Go build information, and every archive member without executing the candidate.
+3. `static-validate` downloads that exact artifact ID and validates the direct-list GoReleaser manifest, one-to-one checksums, the six-target Linux/Darwin/Windows amd64/arm64 matrix, exact compiler version, executable headers, safe modes, and every archive member without executing the candidate. Unix archives require one root `binary-name`; Windows archives require one root `binary-name.exe`. Additional regular documentation paths are allowed when canonical and safe.
 4. `smoke` downloads the same artifact ID, safely materializes only the Linux/amd64 binary, and executes it as the final step under an empty environment and temporary HOME/XDG/database paths.
 5. `publish` runs fresh only after static validation and smoke succeed, downloads the same immutable raw artifact, regenerates `candidate.json`, and uploads the final allowlisted artifact.
 
