@@ -332,11 +332,15 @@ for goos, goarch in platforms:
             elif is_primary and mode == "binary-document": add_tar(bundle, "tool", payload, 0o755); add_tar(bundle, "README.md", b"text\x00binary", 0o644)
             elif is_primary and mode == "invalid-utf8-document": add_tar(bundle, "tool", payload, 0o755); add_tar(bundle, "README.md", b"\xff\xfe", 0o644)
             elif is_primary and mode == "control-document": add_tar(bundle, "tool", payload, 0o755); add_tar(bundle, "README.md", b"text\x07control", 0o644)
+            elif is_primary and mode == "unicode-c1-85": add_tar(bundle, "tool", payload, 0o755); add_tar(bundle, "README.md", "text\u0085control".encode(), 0o644)
+            elif is_primary and mode == "unicode-c1-9b": add_tar(bundle, "tool", payload, 0o755); add_tar(bundle, "README.md", "text\u009bcontrol".encode(), 0o644)
+            elif is_primary and mode == "unicode-bidi-202e": add_tar(bundle, "tool", payload, 0o755); add_tar(bundle, "README.md", "text\u202eformat".encode(), 0o644)
+            elif is_primary and mode == "unicode-bidi-2066": add_tar(bundle, "tool", payload, 0o755); add_tar(bundle, "README.md", "text\u2066format".encode(), 0o644)
             else:
                 add_tar(bundle, expected_binary, payload, 0o755)
                 docs = b"representative backscroll docs" if goos == "linux" else b"representative rootline docs"
                 add_tar(bundle, "LICENSE", docs, 0o644)
-                if goarch == "amd64": add_tar(bundle, "README.md", b"safe product documentation", 0o644)
+                if goarch == "amd64": add_tar(bundle, "README.md", "Documentación segura — español".encode(), 0o644)
     archives.append({"type": "Archive", "name": archive_name, "path": f"dist/{archive_name}", "goos": goos, "goarch": goarch})
 
 primary_tar = dist / "tool_linux_amd64.tar.gz"
@@ -524,6 +528,10 @@ run_static_case "arbitrary TAR payload rejected" arbitrary-payload failure
 run_static_case "binary documentation payload rejected" binary-document failure
 run_static_case "invalid UTF-8 documentation rejected" invalid-utf8-document failure
 run_static_case "control characters in documentation rejected" control-document failure
+run_static_case "Unicode C1 U+0085 rejected" unicode-c1-85 failure
+run_static_case "Unicode C1 U+009B rejected" unicode-c1-9b failure
+run_static_case "Unicode bidi U+202E rejected" unicode-bidi-202e failure
+run_static_case "Unicode bidi U+2066 rejected" unicode-bidi-2066 failure
 run_static_case "Windows malware exe rejected even non-executable" windows-malware-exe failure
 run_static_case "Windows malware dll rejected even non-executable" windows-malware-dll failure
 run_static_case "Windows malware cmd rejected even non-executable" windows-malware-cmd failure
@@ -589,25 +597,44 @@ for line in (dist / "checksums.txt").read_text().splitlines():
 (dist / "checksums.txt").write_text("\n".join(lines) + "\n")
 PY
 extract_output="$smoke_dir/extract-output"
-expect_status "safe smoke extraction succeeds" success "$smoke_dir/extract.log" \
-  env BINARY_NAME=tool GITHUB_OUTPUT="$extract_output" \
-  bash -c "cd '$smoke_dir' && '$TEST_ROOT/extract.sh'"
-sandbox=$(sed -n 's/^sandbox=//p' "$extract_output")
-binary=$(sed -n 's/^binary=//p' "$extract_output")
-# macOS lacks GNU timeout; this fixture preserves the workflow command contract
-# while the actual ubuntu-24.04 runner supplies coreutils timeout.
-cat > "$mock_bin/timeout" <<'TIMEOUT'
-#!/usr/bin/env bash
-shift
-exec "$@"
-TIMEOUT
-chmod +x "$mock_bin/timeout"
-expect_status "isolated candidate smoke succeeds" success "$smoke_dir/smoke.log" \
-  env PATH="$mock_bin:$PATH" SANDBOX="$sandbox" SMOKE_BINARY="$binary" \
-  CANDIDATE_VERSION="$candidate_version" "$TEST_ROOT/smoke.sh"
-expect_status "smoke version failure blocks success" failure "$smoke_dir/smoke-fail.log" \
-  env PATH="$mock_bin:$PATH" SANDBOX="$sandbox" SMOKE_BINARY="$binary" \
-  CANDIDATE_VERSION=9.9.9-bad "$TEST_ROOT/smoke.sh"
+if [[ "$(uname -s)" == Linux ]] && command -v sudo >/dev/null && sudo -n -u nobody true >/dev/null 2>&1 && [[ -x /usr/bin/timeout ]]; then
+  smoke_runner_temp="$smoke_dir/runner-temp"
+  mkdir -p "$smoke_runner_temp"
+  expect_status "safe smoke extraction creates nobody-owned sandbox" success "$smoke_dir/extract.log" \
+    env BINARY_NAME=tool GITHUB_OUTPUT="$extract_output" RUNNER_TEMP="$smoke_runner_temp" \
+    bash -c "cd '$smoke_dir' && '$TEST_ROOT/extract.sh'"
+  sandbox=$(sed -n 's/^sandbox=//p' "$extract_output")
+  binary=$(sed -n 's/^binary=//p' "$extract_output")
+  record "smoke binary is owned by nobody" nobody "$(stat -c '%U' "$binary")"
+  expect_status "isolated candidate smoke succeeds as nobody" success "$smoke_dir/smoke.log" \
+    env SANDBOX="$sandbox" SMOKE_BINARY="$binary" CANDIDATE_VERSION="$candidate_version" \
+    "$TEST_ROOT/smoke.sh"
+  expect_status "smoke version failure blocks success" failure "$smoke_dir/smoke-fail.log" \
+    env SANDBOX="$sandbox" SMOKE_BINARY="$binary" CANDIDATE_VERSION=9.9.9-bad \
+    "$TEST_ROOT/smoke.sh"
+
+  malicious="$smoke_dir/proc-environ-probe"
+  cat > "$malicious" <<PROBE
+#!/bin/sh
+pid=\$PPID
+while [ "\$pid" -gt 1 ] 2>/dev/null; do
+  if tr '\\0' '\\n' < "/proc/\$pid/environ" 2>/dev/null | grep -q '^SMOKE_SENTINEL_SECRET='; then
+    echo "sentinel leaked from ancestor"
+    exit 97
+  fi
+  pid=\$(awk '{print \$4}' "/proc/\$pid/stat" 2>/dev/null || echo 1)
+done
+printf '%s\n' 'tool $candidate_version'
+PROBE
+  sudo -n install -o nobody -g "$(id -gn nobody)" -m 0500 "$malicious" "$sandbox/probe"
+  expect_status "malicious candidate cannot read sentinel from ancestor environments" success "$smoke_dir/probe.log" \
+    env SMOKE_SENTINEL_SECRET=must-not-leak SANDBOX="$sandbox" SMOKE_BINARY="$sandbox/probe" \
+    CANDIDATE_VERSION="$candidate_version" "$TEST_ROOT/smoke.sh"
+else
+  record "dynamic nobody smoke requires Linux passwordless sudo" skipped skipped
+  record "dynamic ancestor environ probe requires Linux procfs" skipped skipped
+  record "dynamic timeout smoke requires ubuntu coreutils" skipped skipped
+fi
 record "failed smoke creates no final staging" absent "$([[ -e "$smoke_dir/candidate-upload" ]] && echo present || echo absent)"
 python3 - "$smoke_dir/raw/dist/artifacts.json" <<'PY'
 import json
@@ -671,6 +698,8 @@ from pathlib import Path
 import re
 import sys
 text = Path(sys.argv[1]).read_text()
+smoke_job = text.split("  smoke:\n", 1)[1].split("\n  publish:\n", 1)[0]
+execute_section = smoke_job.split("      - name: Execute candidate in empty environment\n", 1)[1]
 checks = {
     "top permissions empty": "permissions: {}" in text,
     "metadata only PR read": re.search(r"(?ms)^  metadata:.*?^    permissions:\n      pull-requests: read\n", text) is not None,
@@ -685,7 +714,11 @@ checks = {
     "trusted base config": 'git -C source show "${BASE_SHA}:${GORELEASER_CONFIG}"' in text,
     "PR config never selected": "go-version-file" not in text and "inputs.goreleaser-config }}" not in text.split("Build candidate with sanitized environment", 1)[1],
     "goreleaser action install only": "install-only: true" in text,
-    "smoke execution is last": text.rfind("- name: Execute candidate in empty environment") < text.index("  publish:"),
+    "smoke execution is last": "\n      - name:" not in execute_section,
+    "smoke uses distinct nobody UID": "sudo -n -u nobody -- /usr/bin/env -i" in execute_section,
+    "timeout is inside sanitized command": execute_section.index("/usr/bin/env -i") < execute_section.index("/usr/bin/timeout 30s"),
+    "smoke receives no runtime credentials": all(value not in execute_section for value in ("ACTIONS_", "github.token", "GITHUB_TOKEN", "GH_TOKEN")),
+    "sandbox leaves runner-owned ancestry": "mktemp -d /var/tmp/go-candidate-smoke.XXXXXX" in smoke_job and 'install -o "$smoke_user"' in smoke_job,
 }
 uses = re.findall(r"(?m)^\s*uses:\s*([^\s#]+)", text)
 checks["actions pinned"] = bool(uses) and all(re.fullmatch(r"[^@]+@[0-9a-f]{40}", use) for use in uses)

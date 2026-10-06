@@ -488,6 +488,7 @@ jobs:
           import subprocess
           import sys
           import tempfile
+          import unicodedata
           import zipfile
 
           root = Path("raw").resolve()
@@ -606,8 +607,8 @@ jobs:
                   text = data.decode("utf-8")
               except UnicodeDecodeError:
                   raise SystemExit("::error::documentation payload is not UTF-8")
-              if any((ord(char) < 32 and char not in "\t\n\r") or ord(char) == 127 for char in text):
-                  raise SystemExit("::error::documentation payload contains binary or control data")
+              if any(unicodedata.category(char) in ("Cc", "Cf") and char not in "\t\n\r" for char in text):
+                  raise SystemExit("::error::documentation payload contains Unicode control or format characters")
 
           def validate_members(records, archive_size, expected_binary):
               if not 1 <= len(records) <= MAX_ENTRIES:
@@ -1020,16 +1021,28 @@ jobs:
                           read_exact(stream, padding)
           if len(payloads) != 1:
               raise SystemExit("::error::exact root smoke binary is absent or ambiguous")
-          sandbox = Path(tempfile.mkdtemp(prefix="candidate-smoke-"))
-          binary = sandbox / "candidate"
-          binary.write_bytes(payloads[0])
-          binary.chmod(0o500)
-          for name in ("home", "tmp", "config", "cache", "data", "state", "db"):
-              (sandbox / name).mkdir()
-          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
-              print(f"sandbox={sandbox}", file=output)
-              print(f"binary={binary}", file=output)
+          with tempfile.NamedTemporaryFile(prefix="candidate-smoke-staged-", dir=os.environ["RUNNER_TEMP"], delete=False) as staged:
+              staged.write(payloads[0])
+              staged_binary = Path(staged.name)
+          staged_binary.chmod(0o600)
+          (Path(os.environ["RUNNER_TEMP"]) / "candidate-smoke-stage-path").write_text(str(staged_binary))
           PY
+          staged_binary=$(cat "$RUNNER_TEMP/candidate-smoke-stage-path")
+          smoke_user=nobody
+          smoke_group=$(id -gn "$smoke_user")
+          sandbox=$(sudo -n mktemp -d /var/tmp/go-candidate-smoke.XXXXXX)
+          sudo -n chown "$smoke_user:$smoke_group" "$sandbox"
+          sudo -n chmod 0700 "$sandbox"
+          for name in home tmp config cache data state db work; do
+            sudo -n install -d -o "$smoke_user" -g "$smoke_group" -m 0700 "$sandbox/$name"
+          done
+          sudo -n install -o "$smoke_user" -g "$smoke_group" -m 0500 \
+            "$staged_binary" "$sandbox/candidate"
+          rm -f "$staged_binary" "$RUNNER_TEMP/candidate-smoke-stage-path"
+          {
+            echo "sandbox=$sandbox"
+            echo "binary=$sandbox/candidate"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Execute candidate in empty environment
         env:
@@ -1037,7 +1050,7 @@ jobs:
           SMOKE_BINARY: ${{ steps.extract.outputs.binary }}
           CANDIDATE_VERSION: ${{ needs.metadata.outputs.candidate-version }}
         run: |
-          version_output=$(timeout 30s env -i \
+          version_output=$(sudo -n -u nobody -- /usr/bin/env -i \
             HOME="$SANDBOX/home" \
             TMPDIR="$SANDBOX/tmp" \
             XDG_CONFIG_HOME="$SANDBOX/config" \
@@ -1045,7 +1058,10 @@ jobs:
             XDG_DATA_HOME="$SANDBOX/data" \
             XDG_STATE_HOME="$SANDBOX/state" \
             DATABASE_URL="sqlite:///$SANDBOX/db/candidate.db" \
-            "$SMOKE_BINARY" --version 2>&1)
+            USER=nobody \
+            LOGNAME=nobody \
+            /bin/sh -c 'cd "$1" && exec /usr/bin/timeout 30s "$2" --version' \
+            candidate-smoke "$SANDBOX/work" "$SMOKE_BINARY" 2>&1)
           if [[ "$version_output" != *"$CANDIDATE_VERSION"* ]] || [[ "${version_output,,}" == *dev* ]]; then
             echo "::error::isolated --version output is not the candidate version"
             exit 1
