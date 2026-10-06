@@ -341,6 +341,7 @@ for goos, goarch in platforms:
             elif is_primary and mode == "member-trailing-dot": add_tar(bundle, "tool", payload, 0o755); add_tar(bundle, "docs/guide.md.", b"docs", 0o644)
             elif is_primary and mode == "member-colon": add_tar(bundle, "tool", payload, 0o755); add_tar(bundle, "docs/guide:ads.md", b"docs", 0o644)
             elif is_primary and mode == "member-unicode": add_tar(bundle, "tool", payload, 0o755); add_tar(bundle, "docs/café.md", b"docs", 0o644)
+            elif is_primary and mode == "member-plus": add_tar(bundle, "tool", payload, 0o755); add_tar(bundle, "docs/C++.md", b"docs", 0o644)
             else:
                 add_tar(bundle, expected_binary, payload, 0o755)
                 docs = b"representative backscroll docs" if goos == "linux" else b"representative rootline docs"
@@ -419,6 +420,7 @@ invalid_archive_names = {
     "basename-hidden": ".archive.zip",
     "basename-control": "archive\n.zip",
     "basename-separator": "nested/archive.zip",
+    "basename-plus": "archive+debug.zip",
 }
 if mode in invalid_archive_names:
     archives[0]["path"] = f"dist/{invalid_archive_names[mode]}"
@@ -571,12 +573,14 @@ run_static_case "trailing-space archive basename rejected" basename-trailing-spa
 run_static_case "hidden archive basename rejected" basename-hidden failure
 run_static_case "control archive basename rejected" basename-control failure
 run_static_case "separator in archive basename rejected" basename-separator failure
+run_static_case "plus in archive basename rejected" basename-plus failure
 run_static_case "case-insensitive archive basename collision rejected" basename-case-collision failure
 run_static_case "renamed checksum file rejected" checksum-renamed failure
 run_static_case "Windows device archive member rejected" member-device failure
 run_static_case "trailing-dot archive member rejected" member-trailing-dot failure
 run_static_case "ADS colon archive member rejected" member-colon failure
 run_static_case "Unicode archive member rejected" member-unicode failure
+run_static_case "plus in archive member rejected" member-plus failure
 run_static_case "Windows malware exe rejected even non-executable" windows-malware-exe failure
 run_static_case "Windows malware dll rejected even non-executable" windows-malware-dll failure
 run_static_case "Windows malware cmd rejected even non-executable" windows-malware-cmd failure
@@ -871,6 +875,8 @@ checks = {
     "smoke cleanup is systemd-only": "trap cleanup_sandbox EXIT" in execute_section and "/usr/bin/systemctl kill" in execute_section and "/usr/bin/pkill" not in text,
     "systemd containment properties present": all(value in execute_section for value in ("KillMode=control-group", "NoNewPrivileges=yes", "ProtectSystem=strict", "PrivateNetwork=yes", "MemoryMax=512M", "TasksMax=64", "LimitFSIZE=1M")),
     "candidate output is bounded": "candidate-bounded-capture.py" in execute_section and "limit = 1024 * 1024" in execute_section,
+    "portable basename grammar is consistent": text.count(r"[A-Za-z0-9][A-Za-z0-9._-]*") == 6 and r"[A-Za-z0-9][A-Za-z0-9._+-]*" not in text,
+    "checksum and members use portable contract": text.count('dist/checksums.txt') >= 3 and "portable_basename(part)" in text,
     "CI runs candidate tests on Ubuntu": "runs-on: ubuntu-latest" in ci_text and "bash scripts/test-go-candidate.sh" in ci_text,
 }
 uses = re.findall(r"(?m)^\s*uses:\s*([^\s#]+)", text)
