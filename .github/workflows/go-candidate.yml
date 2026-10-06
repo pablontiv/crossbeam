@@ -4,15 +4,15 @@ on:
   workflow_call:
     inputs:
       source-repository:
-        description: 'Fork repository containing the pull request commit (owner/name)'
+        description: 'Public fork repository containing the PR commit (owner/name)'
         required: true
         type: string
       source-sha:
-        description: 'Exact 40-character pull request commit SHA'
+        description: 'Exact 40-character PR commit SHA'
         required: true
         type: string
       base-sha:
-        description: 'Exact 40-character base commit SHA from the caller repository'
+        description: 'Exact 40-character caller base commit SHA'
         required: true
         type: string
       pr-number:
@@ -20,37 +20,62 @@ on:
         required: true
         type: number
       binary-name:
-        description: 'Binary to execute from the linux/amd64 archive'
+        description: 'Binary expected in every archive'
         required: true
         type: string
-      go-version-file:
-        description: 'File used by setup-go to select Go'
-        required: false
+      go-version:
+        description: 'Exact trusted Go patch version, for example 1.24.1'
+        required: true
         type: string
-        default: 'go.mod'
       goreleaser-config:
-        description: 'GoReleaser configuration in the source repository'
+        description: 'GoReleaser config path read from the caller repository at base-sha'
         required: false
         type: string
         default: '.goreleaser.yml'
+    outputs:
+      artifact-id:
+        description: 'Final validated artifact ID'
+        value: ${{ jobs.publish.outputs.artifact-id }}
+      artifact-digest:
+        description: 'Final validated artifact digest'
+        value: ${{ jobs.publish.outputs.artifact-digest }}
+      artifact-name:
+        description: 'Final validated artifact name'
+        value: ${{ jobs.publish.outputs.artifact-name }}
+      candidate-version:
+        description: 'Validated candidate version'
+        value: ${{ jobs.publish.outputs.candidate-version }}
+      source-sha:
+        description: 'Normalized candidate source SHA'
+        value: ${{ jobs.publish.outputs.source-sha }}
 
-permissions:
-  contents: read
-  pull-requests: read
+permissions: {}
 
 jobs:
-  candidate:
-    name: Build PR candidate
+  metadata:
+    name: Validate trusted metadata
     runs-on: ubuntu-24.04
+    permissions:
+      pull-requests: read
+    outputs:
+      source-sha: ${{ steps.metadata.outputs.source_sha }}
+      base-sha: ${{ steps.metadata.outputs.base_sha }}
+      base-version: ${{ steps.metadata.outputs.base_version }}
+      candidate-version: ${{ steps.metadata.outputs.candidate_version }}
+      base-ref: ${{ steps.metadata.outputs.base_ref }}
     steps:
-      - name: Validate inputs
+      - name: Validate PR and base graph
+        id: metadata
         env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          CALLER_REPOSITORY: ${{ github.repository }}
           SOURCE_REPOSITORY: ${{ inputs.source-repository }}
-          SOURCE_SHA: ${{ inputs.source-sha }}
-          BASE_SHA: ${{ inputs.base-sha }}
+          SOURCE_SHA_INPUT: ${{ inputs.source-sha }}
+          BASE_SHA_INPUT: ${{ inputs.base-sha }}
           PR_NUMBER: ${{ inputs.pr-number }}
           BINARY_NAME: ${{ inputs.binary-name }}
-          GO_VERSION_FILE: ${{ inputs.go-version-file }}
+          GO_VERSION: ${{ inputs.go-version }}
           GORELEASER_CONFIG: ${{ inputs.goreleaser-config }}
         run: |
           python3 - <<'PY'
@@ -62,422 +87,639 @@ jobs:
           repository = os.environ["SOURCE_REPOSITORY"]
           repository_pattern = r"[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?/[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?"
           if not re.fullmatch(repository_pattern, repository) or ".." in repository:
-              errors.append("source-repository must be a non-empty owner/name")
-          for name in ("SOURCE_SHA", "BASE_SHA"):
+              errors.append("source-repository must be an owner/name")
+          for name in ("SOURCE_SHA_INPUT", "BASE_SHA_INPUT"):
               if not re.fullmatch(r"[0-9a-fA-F]{40}", os.environ[name]):
-                  errors.append(f"{name.lower().replace('_', '-')} must be exactly 40 hexadecimal characters")
+                  errors.append(f"{name.lower().replace('_input', '').replace('_', '-')} must be 40 hexadecimal characters")
           if not re.fullmatch(r"[1-9][0-9]*", os.environ["PR_NUMBER"]):
               errors.append("pr-number must be a positive integer")
-          if not os.environ["BINARY_NAME"].strip():
-              errors.append("binary-name must not be empty")
-          safe_path_pattern = re.compile(r"[A-Za-z0-9._/-]+")
-          for name in ("GO_VERSION_FILE", "GORELEASER_CONFIG"):
-              value = os.environ[name]
-              if (not value or not safe_path_pattern.fullmatch(value) or value.startswith(("/", "-"))
-                      or any(part in ("", ".", "..") for part in value.split("/"))):
-                  errors.append(f"{name.lower().replace('_', '-')} must be a safe relative path")
+          binary = os.environ["BINARY_NAME"]
+          if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", binary) or binary.startswith("."):
+              errors.append("binary-name must be a non-hidden basename")
+          if not re.fullmatch(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", os.environ["GO_VERSION"]):
+              errors.append("go-version must be an exact patch version")
+          config = os.environ["GORELEASER_CONFIG"]
+          if (not re.fullmatch(r"[A-Za-z0-9._/-]+", config or "") or config.startswith(("/", "-"))
+                  or any(part in ("", ".", "..") for part in config.split("/"))):
+              errors.append("goreleaser-config must be a safe relative path")
           if errors:
               print("\n".join(f"::error::{error}" for error in errors))
               sys.exit(1)
           PY
 
-      - name: Validate PR provenance
-        env:
-          GH_TOKEN: ${{ github.token }}
-          GITHUB_API_URL: ${{ github.api_url }}
-          CALLER_REPOSITORY: ${{ github.repository }}
-          SOURCE_REPOSITORY: ${{ inputs.source-repository }}
-          SOURCE_SHA: ${{ inputs.source-sha }}
-          BASE_SHA: ${{ inputs.base-sha }}
-          PR_NUMBER: ${{ inputs.pr-number }}
-        run: |
           if [[ -z "$GH_TOKEN" ]]; then
-            echo "::error::GitHub token is unavailable for PR provenance validation"
+            echo "::error::GitHub token is unavailable for PR validation"
             exit 1
           fi
+          source_sha=${SOURCE_SHA_INPUT,,}
+          base_sha=${BASE_SHA_INPUT,,}
           payload=$(curl --fail-with-body --silent --show-error \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header "Accept: application/vnd.github+json" \
             --header "X-GitHub-Api-Version: 2022-11-28" \
             "${GITHUB_API_URL%/}/repos/${CALLER_REPOSITORY}/pulls/${PR_NUMBER}")
-          PR_PAYLOAD="$payload" python3 - <<'PY'
+          api_values=$(PR_PAYLOAD="$payload" python3 - "$SOURCE_REPOSITORY" "$source_sha" "$base_sha" <<'PY'
           import json
           import os
+          import re
+          import sys
 
           try:
               pull = json.loads(os.environ["PR_PAYLOAD"])
-              actual = (
-                  pull["head"]["repo"]["full_name"],
-                  pull["head"]["sha"],
-                  pull["base"]["sha"],
-              )
-          except (KeyError, TypeError, json.JSONDecodeError) as error:
+              head_repo = pull["head"]["repo"]["full_name"]
+              head_sha = pull["head"]["sha"].lower()
+              base_sha = pull["base"]["sha"].lower()
+              base_ref = pull["base"]["ref"]
+          except (AttributeError, KeyError, TypeError, json.JSONDecodeError) as error:
               raise SystemExit(f"::error::Invalid pull request API payload: {error}")
-          expected = (
-              os.environ["SOURCE_REPOSITORY"],
-              os.environ["SOURCE_SHA"],
-              os.environ["BASE_SHA"],
-          )
-          if actual != expected:
-              raise SystemExit(
-                  "::error::Pull request provenance mismatch: "
-                  f"expected head repo/SHA and base SHA {expected!r}, got {actual!r}"
-              )
+          if (head_repo, head_sha, base_sha) != tuple(sys.argv[1:4]):
+              raise SystemExit("::error::Pull request head repository/SHA or base SHA does not match inputs")
+          if not re.fullmatch(r"[A-Za-z0-9._/-]+", base_ref) or base_ref.startswith(("/", "-")) or ".." in base_ref:
+              raise SystemExit("::error::Unsafe PR base ref")
+          print(base_ref)
           PY
+          )
 
-      - name: Checkout exact PR source without credentials
-        env:
-          SOURCE_REPOSITORY: ${{ inputs.source-repository }}
-          SOURCE_SHA: ${{ inputs.source-sha }}
-        run: |
-          git init .
-          git remote add origin "https://github.com/${SOURCE_REPOSITORY}.git"
-          git fetch --no-tags --depth=1 origin "$SOURCE_SHA"
-          git checkout --detach "$SOURCE_SHA"
-          if [[ "$(git rev-parse HEAD)" != "$SOURCE_SHA" ]]; then
-            echo "::error::Checked out HEAD does not equal source SHA"
+          graph=$(mktemp -d)
+          git -C "$graph" init
+          git -C "$graph" remote add base "https://github.com/${CALLER_REPOSITORY}.git"
+          git -C "$graph" fetch --no-tags base "+refs/heads/${api_values}:refs/remotes/base/pr-base"
+          branch_tip=$(git -C "$graph" rev-parse refs/remotes/base/pr-base)
+          if [[ "$branch_tip" != "$base_sha" ]]; then
+            echo "::error::PR base SHA is no longer the base branch tip; regenerate the candidate"
             exit 1
           fi
-
-      - name: Trust only stable caller tags
-        id: source
-        env:
-          SOURCE_SHA: ${{ inputs.source-sha }}
-          BASE_SHA: ${{ inputs.base-sha }}
-          BASE_REPOSITORY: ${{ github.repository }}
-          PR_NUMBER: ${{ inputs.pr-number }}
-        run: |
-          actual_head=$(git rev-parse HEAD)
-          if [[ "${actual_head,,}" != "${SOURCE_SHA,,}" ]]; then
-            echo "::error::Checked out HEAD $actual_head does not equal source SHA $SOURCE_SHA"
-            exit 1
-          fi
-          git config core.abbrev 7
-
-          mapfile -t fork_tags < <(git tag -l)
-          if (( ${#fork_tags[@]} > 0 )); then
-            git tag -d -- "${fork_tags[@]}"
-          fi
-          if [[ -n "$(git tag -l)" ]]; then
-            echo "::error::Failed to remove source repository tags"
-            exit 1
-          fi
-
-          if [[ "$(git rev-parse --is-shallow-repository)" == "true" ]]; then
-            git fetch --no-tags --unshallow origin "$SOURCE_SHA"
-          fi
-          if [[ "$(git rev-parse --is-shallow-repository)" != "false" ]]; then
-            echo "::error::Source history remains shallow"
-            exit 1
-          fi
-          mapfile -t deepened_tags < <(git tag -l)
-          if (( ${#deepened_tags[@]} > 0 )); then
-            git tag -d -- "${deepened_tags[@]}"
-          fi
-
-          git remote add candidate-base "https://github.com/${BASE_REPOSITORY}.git"
-          git fetch --no-tags candidate-base "$BASE_SHA"
-          fetched_base=$(git rev-parse FETCH_HEAD)
-          if [[ "${fetched_base,,}" != "${BASE_SHA,,}" ]]; then
-            echo "::error::Fetched base $fetched_base does not equal requested base SHA $BASE_SHA"
-            exit 1
-          fi
-
           while read -r object ref; do
             [[ -n "$object" ]] || continue
             tag=${ref#refs/tags/}
             if [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
-              git fetch --no-tags candidate-base "$ref:$ref"
+              git -C "$graph" fetch --no-tags base "$ref:$ref"
             fi
-          done < <(git ls-remote --tags --refs candidate-base 'refs/tags/v*')
-
-          invalid_tags=$(git tag -l | grep -Ev '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' || true)
-          if [[ -n "$invalid_tags" ]]; then
-            echo "::error::A non-stable tag entered the checkout"
+          done < <(git -C "$graph" ls-remote --tags --refs base 'refs/tags/v*')
+          base_version=$(git -C "$graph" tag --merged "$base_sha" -l 'v*' | sort -V | tail -n 1)
+          if [[ -z "$base_version" ]] || ! git -C "$graph" merge-base --is-ancestor "$base_version^{commit}" "$base_sha"; then
+            echo "::error::No trusted stable base tag is an ancestor of base-sha"
             exit 1
           fi
-
-          base_version=$(git tag --merged "$SOURCE_SHA" -l 'v*' | sort -V | tail -n 1)
-          if [[ -z "$base_version" ]]; then
-            echo "::error::No stable caller tag is reachable from source SHA"
-            exit 1
-          fi
-          candidate_version=$(python3 - "$base_version" "$PR_NUMBER" "${SOURCE_SHA:0:7}" <<'PY'
+          candidate_version=$(python3 - "$base_version" "$PR_NUMBER" "${source_sha:0:7}" <<'PY'
           import re
           import sys
-
           match = re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", sys.argv[1])
           if not match:
-              raise SystemExit("invalid stable base version")
+              raise SystemExit("invalid base version")
           major, minor, patch = map(int, match.groups())
-          print(f"{major}.{minor}.{patch + 1}-pr.{sys.argv[2]}.g{sys.argv[3].lower()}")
+          print(f"{major}.{minor}.{patch + 1}-pr.{sys.argv[2]}.g{sys.argv[3]}")
           PY
           )
-          echo "base_version=$base_version" >> "$GITHUB_OUTPUT"
-          echo "candidate_version=$candidate_version" >> "$GITHUB_OUTPUT"
+          {
+            echo "source_sha=$source_sha"
+            echo "base_sha=$base_sha"
+            echo "base_version=$base_version"
+            echo "candidate_version=$candidate_version"
+            echo "base_ref=$api_values"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Validate source paths
-        id: paths
-        env:
-          GO_VERSION_FILE: ${{ inputs.go-version-file }}
-          GORELEASER_CONFIG: ${{ inputs.goreleaser-config }}
-        run: |
-          python3 - <<'PY'
-          import os
-          from pathlib import Path
-          import re
-          import stat
-
-          workspace = Path.cwd().resolve()
-
-          def safe_regular_file(raw):
-              path = Path(raw)
-              candidate = workspace / path
-              components = [workspace / Path(*path.parts[:index]) for index in range(1, len(path.parts) + 1)]
-              if any(component.is_symlink() for component in components):
-                  raise SystemExit(f"::error::Path must not contain symlinks: {raw}")
-              resolved = candidate.resolve(strict=True)
-              if resolved.parent != workspace and workspace not in resolved.parents:
-                  raise SystemExit(f"::error::Path escapes the workspace: {raw}")
-              if not stat.S_ISREG(resolved.stat(follow_symlinks=False).st_mode):
-                  raise SystemExit(f"::error::Path is not a regular file: {raw}")
-              return resolved
-
-          go_path = safe_regular_file(os.environ["GO_VERSION_FILE"])
-          config_path = safe_regular_file(os.environ["GORELEASER_CONFIG"])
-          go_text = go_path.read_text()
-          direct = re.fullmatch(r"v?([0-9]+\.[0-9]+\.[0-9]+)\s*", go_text)
-          directives = re.findall(r"(?m)^go\s+([0-9]+\.[0-9]+\.[0-9]+)\s*$", go_text)
-          if direct:
-              go_version = direct.group(1)
-          elif len(directives) == 1:
-              go_version = directives[0]
-          else:
-              raise SystemExit("::error::go-version-file must specify exactly one Go patch version")
-          output_path = Path(os.environ["GITHUB_OUTPUT"])
-          with output_path.open("a") as output:
-              print(f"go_version={go_version}", file=output)
-              print(f"goreleaser_config={config_path.relative_to(workspace).as_posix()}", file=output)
-          PY
-
-      - name: Setup Go
+  build:
+    name: Build untrusted raw candidate
+    needs: metadata
+    runs-on: ubuntu-24.04
+    permissions: {}
+    outputs:
+      raw-artifact-id: ${{ steps.raw.outputs.artifact-id }}
+      raw-artifact-digest: ${{ steps.raw.outputs.artifact-digest }}
+    steps:
+      - name: Setup trusted Go toolchain
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v5.6.0
         with:
-          go-version: ${{ steps.paths.outputs.go_version }}
+          go-version: ${{ inputs.go-version }}
           cache: false
+          token: ''
 
-      - name: Build clean GoReleaser snapshot
+      - name: Verify local Go toolchain
+        env:
+          EXPECTED_GO_VERSION: ${{ inputs.go-version }}
+          GOTOOLCHAIN: local
+        run: |
+          actual=$(go env GOVERSION)
+          if [[ "$actual" != "go${EXPECTED_GO_VERSION}" ]]; then
+            echo "::error::Go toolchain $actual does not equal go${EXPECTED_GO_VERSION}"
+            exit 1
+          fi
+
+      - name: Install GoReleaser without running source
         uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94  # v6.3.0
         with:
           distribution: goreleaser
           version: 'v2.18.2'
-          args: release --snapshot --clean --config=${{ steps.paths.outputs.goreleaser_config }}
-        env:
-          PR_NUMBER: ${{ inputs.pr-number }}
+          install-only: true
 
-      - name: Validate candidate and stage upload
-        id: candidate
+      - name: Fetch exact public source and trusted config
         env:
-          SOURCE_SHA: ${{ inputs.source-sha }}
-          BASE_SHA: ${{ inputs.base-sha }}
+          SOURCE_REPOSITORY: ${{ inputs.source-repository }}
+          SOURCE_SHA: ${{ needs.metadata.outputs.source-sha }}
+          BASE_REPOSITORY: ${{ github.repository }}
+          BASE_SHA: ${{ needs.metadata.outputs.base-sha }}
+          BASE_VERSION: ${{ needs.metadata.outputs.base-version }}
+          GORELEASER_CONFIG: ${{ inputs.goreleaser-config }}
+        run: |
+          git init source
+          git -C source remote add origin "https://github.com/${SOURCE_REPOSITORY}.git"
+          git -C source fetch --no-tags origin "$SOURCE_SHA"
+          git -C source checkout --detach "$SOURCE_SHA"
+          [[ "$(git -C source rev-parse HEAD)" == "$SOURCE_SHA" ]]
+
+          git -C source remote add base "https://github.com/${BASE_REPOSITORY}.git"
+          git -C source fetch --no-tags base "$BASE_SHA"
+          git -C source fetch --no-tags base "refs/tags/${BASE_VERSION}:refs/tags/${BASE_VERSION}"
+          if ! git -C source merge-base --is-ancestor "$BASE_SHA" "$SOURCE_SHA"; then
+            echo "::error::base-sha must be an ancestor of source-sha; rebase and regenerate"
+            exit 1
+          fi
+          if ! git -C source merge-base --is-ancestor "$BASE_VERSION^{commit}" "$BASE_SHA"; then
+            echo "::error::trusted base version is not an ancestor of base-sha"
+            exit 1
+          fi
+
+          mode=$(git -C source ls-tree "$BASE_SHA" -- "$GORELEASER_CONFIG" | awk 'NR == 1 {print $1}')
+          if [[ "$mode" != "100644" && "$mode" != "100755" ]]; then
+            echo "::error::GoReleaser config at base-sha must be a regular blob"
+            exit 1
+          fi
+          trusted_config="$RUNNER_TEMP/trusted-goreleaser.yml"
+          git -C source show "${BASE_SHA}:${GORELEASER_CONFIG}" > "$trusted_config"
+          printf '%s\n' "$trusted_config" > "$RUNNER_TEMP/trusted-config-path"
+
+      - name: Build candidate with sanitized environment
+        env:
           PR_NUMBER: ${{ inputs.pr-number }}
-          BASE_VERSION: ${{ steps.source.outputs.base_version }}
-          CANDIDATE_VERSION: ${{ steps.source.outputs.candidate_version }}
+        run: |
+          trusted_config=$(cat "$RUNNER_TEMP/trusted-config-path")
+          cd source
+          env -i \
+            HOME="$HOME" \
+            PATH="$PATH" \
+            TMPDIR="$RUNNER_TEMP" \
+            GOTOOLCHAIN=local \
+            PR_NUMBER="$PR_NUMBER" \
+            goreleaser release --snapshot --clean --config "$trusted_config"
+
+      - name: Bound and stage raw dist
+        env:
+          RAW_ROOT: ${{ runner.temp }}/candidate-raw
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          import shutil
+          import stat
+
+          workspace = Path.cwd().resolve()
+          dist = (workspace / "source/dist").resolve(strict=True)
+          if dist.is_symlink() or not dist.is_dir():
+              raise SystemExit("::error::dist must be a real directory")
+
+          def safe_file(raw):
+              if not isinstance(raw, str) or not raw or Path(raw).is_absolute() or "\\" in raw:
+                  raise SystemExit("::error::unsafe dist path")
+              path = workspace / "source" / raw
+              try:
+                  path.relative_to(dist)
+              except ValueError:
+                  raise SystemExit("::error::dist path escapes")
+              if any(part in ("", ".", "..") or part.startswith(".") for part in Path(raw).parts):
+                  raise SystemExit("::error::hidden or traversing dist path")
+              if any(parent.is_symlink() for parent in [path, *path.parents] if parent != workspace.parent):
+                  raise SystemExit("::error::dist path contains symlink")
+              resolved = path.resolve(strict=True)
+              resolved.relative_to(dist)
+              if not stat.S_ISREG(resolved.stat(follow_symlinks=False).st_mode):
+                  raise SystemExit("::error::dist path is not regular")
+              return resolved
+
+          artifacts_path = safe_file("dist/artifacts.json")
+          metadata_path = safe_file("dist/metadata.json")
+          document = json.loads(artifacts_path.read_text())
+          artifacts = document.get("artifacts") if isinstance(document, dict) else document
+          if not isinstance(artifacts, list) or not all(isinstance(item, dict) for item in artifacts):
+              raise SystemExit("::error::invalid artifacts.json")
+          selected = [item for item in artifacts if item.get("type") in ("Archive", "Checksum")]
+          archives = [item for item in selected if item.get("type") == "Archive"]
+          checksums = [item for item in selected if item.get("type") == "Checksum"]
+          if not 1 <= len(archives) <= 32 or len(checksums) != 1:
+              raise SystemExit("::error::raw artifact count is outside limits")
+          files = [artifacts_path, metadata_path, *(safe_file(item.get("path")) for item in selected)]
+          if len({path.name.casefold() for path in files}) != len(files):
+              raise SystemExit("::error::raw basenames collide")
+          total = sum(path.stat().st_size for path in files)
+          if total > 1024 * 1024 * 1024 or any(path.stat().st_size > 256 * 1024 * 1024 for path in files):
+              raise SystemExit("::error::raw artifact size limit exceeded")
+          target = Path(os.environ["RAW_ROOT"])
+          if target.exists():
+              shutil.rmtree(target)
+          target_dist = target / "dist"
+          target_dist.mkdir(parents=True)
+          for path in sorted(files, key=lambda item: item.name):
+              shutil.copy2(path, target_dist / path.name)
+          PY
+
+      - name: Upload raw candidate dist
+        id: raw
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: go-candidate-raw-pr-${{ inputs.pr-number }}-${{ needs.metadata.outputs.source-sha }}
+          path: ${{ runner.temp }}/candidate-raw/
+          compression-level: 0
+          include-hidden-files: true
+          retention-days: 1
+          overwrite: false
+          if-no-files-found: error
+
+  static-validate:
+    name: Validate raw candidate without execution
+    needs: [metadata, build]
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - name: Setup trusted Go inspector
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v5.6.0
+        with:
+          go-version: ${{ inputs.go-version }}
+          cache: false
+          token: ''
+
+      - name: Download exact raw artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          artifact-ids: ${{ needs.build.outputs.raw-artifact-id }}
+          path: raw
+          merge-multiple: true
+
+      - name: Validate raw candidate statically
+        env:
+          SOURCE_SHA: ${{ needs.metadata.outputs.source-sha }}
+          CANDIDATE_VERSION: ${{ needs.metadata.outputs.candidate-version }}
           BINARY_NAME: ${{ inputs.binary-name }}
+          GO_VERSION: ${{ inputs.go-version }}
         run: |
           python3 - <<'PY'
           import hashlib
           import json
           import os
-          from pathlib import Path
+          from pathlib import Path, PurePosixPath
           import re
-          import shutil
           import stat
-          import sys
+          import subprocess
           import tarfile
           import tempfile
           import zipfile
 
-          workspace = Path.cwd().resolve()
-          dist_lexical = workspace / "dist"
-          if dist_lexical.is_symlink() or not dist_lexical.is_dir():
-              raise SystemExit("::error::dist must be a real directory")
-          dist = dist_lexical.resolve(strict=True)
+          root = Path("raw").resolve()
+          dist = root / "dist"
+          if dist.is_symlink() or not dist.is_dir():
+              raise SystemExit("::error::raw dist must be a real directory")
+          MAX_ENTRIES = 128
+          MAX_MEMBER = 256 * 1024 * 1024
+          MAX_EXPANDED = 512 * 1024 * 1024
+          MAX_RATIO = 200
 
-          def safe_dist_file(raw):
-              if not isinstance(raw, str) or not raw or Path(raw).is_absolute():
-                  raise SystemExit(f"::error::Artifact path must be relative: {raw!r}")
-              if any(part in ("", ".", "..") for part in raw.split("/")):
-                  raise SystemExit(f"::error::Artifact path contains traversal: {raw!r}")
-              lexical = workspace / raw
-              try:
-                  lexical.relative_to(dist_lexical)
-              except ValueError:
-                  raise SystemExit(f"::error::Artifact path is outside dist: {raw!r}")
-              relative = lexical.relative_to(workspace)
-              components = [workspace / Path(*relative.parts[:index]) for index in range(1, len(relative.parts) + 1)]
-              if any(component.is_symlink() for component in components):
-                  raise SystemExit(f"::error::Artifact path contains a symlink: {raw!r}")
-              try:
-                  resolved = lexical.resolve(strict=True)
-                  resolved.relative_to(dist)
-              except (FileNotFoundError, ValueError):
-                  raise SystemExit(f"::error::Artifact path is missing or escapes dist: {raw!r}")
-              if not stat.S_ISREG(resolved.stat(follow_symlinks=False).st_mode):
-                  raise SystemExit(f"::error::Artifact path is not a regular file: {raw!r}")
-              return resolved
+          def regular(path):
+              if path.is_symlink() or not path.is_file() or not stat.S_ISREG(path.stat(follow_symlinks=False).st_mode):
+                  raise SystemExit(f"::error::not a regular raw file: {path}")
+              return path
 
-          artifacts_path = safe_dist_file("dist/artifacts.json")
-          metadata_path = safe_dist_file("dist/metadata.json")
-          artifacts_document = json.loads(artifacts_path.read_text())
-          artifacts = artifacts_document.get("artifacts") if isinstance(artifacts_document, dict) else artifacts_document
+          artifacts_path = regular(dist / "artifacts.json")
+          metadata_path = regular(dist / "metadata.json")
+          document = json.loads(artifacts_path.read_text())
+          artifacts = document.get("artifacts") if isinstance(document, dict) else document
           if not isinstance(artifacts, list) or not all(isinstance(item, dict) for item in artifacts):
-              raise SystemExit("::error::artifacts.json must contain an artifacts array of objects")
+              raise SystemExit("::error::invalid artifacts.json")
           archives = [item for item in artifacts if item.get("type") == "Archive"]
-          if not archives:
-              raise SystemExit("::error::artifacts.json contains no Archive")
+          checksum_items = [item for item in artifacts if item.get("type") == "Checksum"]
+          if not 1 <= len(archives) <= 32 or len(checksum_items) != 1:
+              raise SystemExit("::error::invalid archive/checksum inventory")
 
-          metadata = json.loads(metadata_path.read_text())
-          expected_version = os.environ["CANDIDATE_VERSION"]
-          expected_sha = os.environ["SOURCE_SHA"].lower()
-          if metadata.get("version") != expected_version:
-              raise SystemExit(f"::error::metadata version {metadata.get('version')!r} is not {expected_version!r}")
-          if "dev" in metadata.get("version", "").lower():
-              raise SystemExit("::error::metadata version contains dev")
-          if str(metadata.get("commit", "")).lower() != expected_sha:
-              raise SystemExit("::error::metadata commit does not equal source SHA")
-          expected_pattern = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-pr\.[1-9][0-9]*\.g[0-9a-f]{7}$")
-          if not expected_pattern.fullmatch(metadata["version"]):
-              raise SystemExit("::error::metadata version does not match the candidate pattern")
+          def raw_path(item):
+              raw = item.get("path")
+              if not isinstance(raw, str) or Path(raw).is_absolute() or "\\" in raw:
+                  raise SystemExit("::error::unsafe artifact path")
+              parts = PurePosixPath(raw).parts
+              if len(parts) != 2 or parts[0] != "dist" or any(part in ("", ".", "..") or part.startswith(".") for part in parts):
+                  raise SystemExit("::error::artifact path must be dist/non-hidden-basename")
+              return regular(root / Path(*parts))
 
-          checksum_artifacts = [item for item in artifacts if item.get("type") == "Checksum"]
-          if len(checksum_artifacts) != 1:
-              raise SystemExit("::error::artifacts.json must contain exactly one Checksum")
-          checksum_path = safe_dist_file(checksum_artifacts[0].get("path"))
+          archive_paths = [(item, raw_path(item)) for item in archives]
+          checksum_path = raw_path(checksum_items[0])
+          expected_files = {"artifacts.json", "metadata.json", checksum_path.name, *(path.name for _, path in archive_paths)}
+          actual_files = {path.name for path in dist.iterdir() if path.is_file() and not path.is_symlink()}
+          if actual_files != expected_files or len(list(dist.iterdir())) != len(expected_files):
+              raise SystemExit("::error::raw dist inventory does not exactly match declarations")
+          if len({name.casefold() for name in expected_files}) != len(expected_files):
+              raise SystemExit("::error::raw filename casefold collision")
+
           checksums = {}
           for line in checksum_path.read_text().splitlines():
-              match = re.fullmatch(r"([0-9a-fA-F]{64})  ([^/]+)", line)
-              if not match:
-                  raise SystemExit("::error::invalid checksum line")
-              name = match.group(2)
-              if name in checksums:
-                  raise SystemExit(f"::error::duplicate checksum entry: {name}")
-              checksums[name] = match.group(1).lower()
+              match = re.fullmatch(r"([0-9a-fA-F]{64})  ([A-Za-z0-9][A-Za-z0-9._-]*)", line)
+              if not match or match.group(2).startswith(".") or match.group(2) in checksums:
+                  raise SystemExit("::error::invalid or duplicate checksum")
+              checksums[match.group(2)] = match.group(1).lower()
+          archive_names = {path.name for _, path in archive_paths}
+          if set(checksums) != archive_names:
+              raise SystemExit("::error::checksums do not map one-to-one to archives")
 
-          archive_manifest = []
-          archive_files = []
-          seen_names = set()
-          linux_amd64 = []
-          for item in archives:
-              path = safe_dist_file(item.get("path"))
-              if path.name in seen_names:
-                  raise SystemExit(f"::error::duplicate archive basename: {path.name}")
-              seen_names.add(path.name)
-              digest = hashlib.sha256(path.read_bytes()).hexdigest()
-              if checksums.get(path.name) != digest:
-                  raise SystemExit(f"::error::checksum missing or incorrect for {path.name}")
-              entry = {
-                  "name": item.get("name", path.name),
-                  "file": path.name,
-                  "goos": item.get("goos"),
-                  "goarch": item.get("goarch"),
-                  "sha256": digest,
-              }
-              archive_manifest.append(entry)
-              archive_files.append(path)
-              if item.get("goos") == "linux" and item.get("goarch") == "amd64":
-                  linux_amd64.append(path)
-          if set(checksums) != seen_names:
-              raise SystemExit("::error::checksums must correspond exactly one-to-one with declared archives")
-          if checksum_path.name in seen_names or checksum_path.name == "candidate.json":
-              raise SystemExit("::error::staged artifact basenames must be unique")
-          archive_manifest.sort(key=lambda entry: entry["file"])
-          archive_files.sort(key=lambda path: path.name)
-          if len(linux_amd64) != 1:
-              raise SystemExit("::error::expected exactly one linux/amd64 Archive")
+          metadata = json.loads(metadata_path.read_text())
+          if metadata.get("version") != os.environ["CANDIDATE_VERSION"] or "dev" in metadata.get("version", "").lower():
+              raise SystemExit("::error::candidate metadata version mismatch")
+          if str(metadata.get("commit", "")).lower() != os.environ["SOURCE_SHA"]:
+              raise SystemExit("::error::candidate metadata commit mismatch")
 
-          binary_name = os.environ["BINARY_NAME"]
-          archive = linux_amd64[0]
+          def safe_member_name(name):
+              if not name or name.startswith("/") or "\\" in name or any(ord(char) < 32 or ord(char) > 126 for char in name):
+                  raise SystemExit("::error::archive member path must be relative printable ASCII")
+              parts = PurePosixPath(name).parts
+              if any(part in ("", ".", "..") or part.startswith(".")
+                     or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._+-]*", part) for part in parts):
+                  raise SystemExit("::error::archive member is hidden, traversing, or unsafe")
+              return parts
+
+          matrix = set()
+          for item, archive in sorted(archive_paths, key=lambda pair: pair[1].name):
+              if hashlib.sha256(archive.read_bytes()).hexdigest() != checksums[archive.name]:
+                  raise SystemExit("::error::archive checksum mismatch")
+              platform = (item.get("goos"), item.get("goarch"))
+              if not all(isinstance(value, str) and re.fullmatch(r"[a-z0-9]+", value) for value in platform) or platform in matrix:
+                  raise SystemExit("::error::invalid or duplicate platform matrix entry")
+              matrix.add(platform)
+              members = []
+              expanded = 0
+              if zipfile.is_zipfile(archive):
+                  with zipfile.ZipFile(archive) as bundle:
+                      for info in bundle.infolist():
+                          mode = info.external_attr >> 16
+                          if info.is_dir() or (mode and not stat.S_ISREG(mode)) or info.flag_bits & 1:
+                              raise SystemExit("::error::zip contains non-regular or encrypted member")
+                          members.append((info.filename, info.file_size, info.compress_size, lambda value=info: bundle.read(value)))
+                      member_data = [(name, size, compressed, reader()) for name, size, compressed, reader in members]
+              elif tarfile.is_tarfile(archive):
+                  with tarfile.open(archive, "r:*") as bundle:
+                      for member in bundle.getmembers():
+                          if not member.isfile():
+                              raise SystemExit("::error::tar contains link, directory, device, or other non-regular member")
+                          extracted = bundle.extractfile(member)
+                          if extracted is None:
+                              raise SystemExit("::error::tar member cannot be read")
+                          members.append((member.name, member.size, archive.stat().st_size, extracted.read()))
+                      member_data = members
+              else:
+                  raise SystemExit("::error::unsupported archive format")
+              if not 1 <= len(member_data) <= MAX_ENTRIES:
+                  raise SystemExit("::error::archive entry limit exceeded")
+              seen = set()
+              binaries = []
+              for name, size, compressed, data in member_data:
+                  parts = safe_member_name(name)
+                  folded = name.casefold()
+                  if folded in seen:
+                      raise SystemExit("::error::duplicate or casefold-colliding archive member")
+                  seen.add(folded)
+                  if size != len(data) or size > MAX_MEMBER:
+                      raise SystemExit("::error::archive member size limit exceeded")
+                  expanded += size
+                  if (size and compressed <= 0) or (compressed > 0 and size > compressed * MAX_RATIO):
+                      raise SystemExit("::error::archive compression ratio limit exceeded")
+                  if parts[-1] == os.environ["BINARY_NAME"]:
+                      binaries.append(data)
+              if expanded > MAX_EXPANDED or expanded > max(archive.stat().st_size, 1) * MAX_RATIO:
+                  raise SystemExit("::error::archive expanded size limit exceeded")
+              if len(binaries) != 1:
+                  raise SystemExit("::error::archive must contain binary-name exactly once")
+              with tempfile.NamedTemporaryFile() as binary:
+                  binary.write(binaries[0])
+                  binary.flush()
+                  result = subprocess.run(["go", "version", "-m", binary.name], check=True, text=True, capture_output=True)
+              if f"go{os.environ['GO_VERSION']}" not in result.stdout:
+                  raise SystemExit("::error::binary Go toolchain mismatch")
+              revisions = re.findall(r"(?m)^\s*build\s+vcs\.revision=(\S+)\s*$", result.stdout)
+              if revisions != [os.environ["SOURCE_SHA"]]:
+                  raise SystemExit("::error::binary revision mismatch")
+          if ("linux", "amd64") not in matrix:
+              raise SystemExit("::error::platform matrix lacks linux/amd64")
+          PY
+
+  smoke:
+    name: Isolated linux amd64 smoke
+    needs: [metadata, build, static-validate]
+    runs-on: ubuntu-24.04
+    permissions: {}
+    steps:
+      - name: Download exact raw artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          artifact-ids: ${{ needs.build.outputs.raw-artifact-id }}
+          path: raw
+          merge-multiple: true
+
+      - name: Extract only validated smoke binary
+        id: extract
+        env:
+          BINARY_NAME: ${{ inputs.binary-name }}
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path, PurePosixPath
+          import stat
+          import tarfile
+          import tempfile
+          import zipfile
+
+          root = Path("raw").resolve()
+          dist = root / "dist"
+          if dist.is_symlink() or not dist.is_dir():
+              raise SystemExit("::error::raw dist must be a real directory")
+          artifacts = json.loads((dist / "artifacts.json").read_text())
+          artifacts = artifacts.get("artifacts") if isinstance(artifacts, dict) else artifacts
+          matches = [item for item in artifacts if item.get("type") == "Archive" and item.get("goos") == "linux" and item.get("goarch") == "amd64"]
+          if len(matches) != 1:
+              raise SystemExit("::error::expected one linux/amd64 archive")
+          raw = matches[0].get("path")
+          parts = PurePosixPath(raw).parts
+          if len(parts) != 2 or parts[0] != "dist" or any(part in ("", ".", "..") or part.startswith(".") for part in parts):
+              raise SystemExit("::error::unsafe smoke archive path")
+          archive = root / Path(*parts)
           payloads = []
           if zipfile.is_zipfile(archive):
               with zipfile.ZipFile(archive) as bundle:
                   for info in bundle.infolist():
                       mode = info.external_attr >> 16
-                      if Path(info.filename).name == binary_name and not info.is_dir() and not stat.S_ISLNK(mode):
+                      if PurePosixPath(info.filename).name == os.environ["BINARY_NAME"] and not info.is_dir() and (not mode or stat.S_ISREG(mode)):
                           payloads.append(bundle.read(info))
           elif tarfile.is_tarfile(archive):
               with tarfile.open(archive, "r:*") as bundle:
                   for member in bundle.getmembers():
-                      if Path(member.name).name == binary_name and member.isfile():
-                          extracted = bundle.extractfile(member)
-                          if extracted is not None:
-                              payloads.append(extracted.read())
-          else:
-              raise SystemExit("::error::linux/amd64 Archive is not a supported tar or zip file")
+                      if PurePosixPath(member.name).name == os.environ["BINARY_NAME"] and member.isfile():
+                          stream = bundle.extractfile(member)
+                          if stream is not None:
+                              payloads.append(stream.read())
           if len(payloads) != 1:
-              raise SystemExit("::error::linux/amd64 Archive must contain binary-name exactly once")
+              raise SystemExit("::error::smoke binary is absent or ambiguous")
+          sandbox = Path(tempfile.mkdtemp(prefix="candidate-smoke-"))
+          binary = sandbox / "candidate"
+          binary.write_bytes(payloads[0])
+          binary.chmod(0o500)
+          for name in ("home", "tmp", "config", "cache", "data", "state", "db"):
+              (sandbox / name).mkdir()
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+              print(f"sandbox={sandbox}", file=output)
+              print(f"binary={binary}", file=output)
+          PY
 
-          smoke_dir = Path(tempfile.mkdtemp(prefix="go-candidate-smoke-"))
-          smoke_binary = smoke_dir / "candidate-binary"
-          smoke_binary.write_bytes(payloads[0])
-          smoke_binary.chmod(0o700)
+      - name: Execute candidate in empty environment
+        env:
+          SANDBOX: ${{ steps.extract.outputs.sandbox }}
+          SMOKE_BINARY: ${{ steps.extract.outputs.binary }}
+          CANDIDATE_VERSION: ${{ needs.metadata.outputs.candidate-version }}
+        run: |
+          version_output=$(timeout 30s env -i \
+            HOME="$SANDBOX/home" \
+            TMPDIR="$SANDBOX/tmp" \
+            XDG_CONFIG_HOME="$SANDBOX/config" \
+            XDG_CACHE_HOME="$SANDBOX/cache" \
+            XDG_DATA_HOME="$SANDBOX/data" \
+            XDG_STATE_HOME="$SANDBOX/state" \
+            DATABASE_URL="sqlite:///$SANDBOX/db/candidate.db" \
+            "$SMOKE_BINARY" --version 2>&1)
+          if [[ "$version_output" != *"$CANDIDATE_VERSION"* ]] || [[ "${version_output,,}" == *dev* ]]; then
+            echo "::error::isolated --version output is not the candidate version"
+            exit 1
+          fi
 
+  publish:
+    name: Publish validated candidate
+    needs: [metadata, build, static-validate, smoke]
+    runs-on: ubuntu-24.04
+    permissions: {}
+    outputs:
+      artifact-id: ${{ steps.final.outputs.artifact-id }}
+      artifact-digest: ${{ steps.final.outputs.artifact-digest }}
+      artifact-name: ${{ steps.manifest.outputs.artifact_name }}
+      candidate-version: ${{ needs.metadata.outputs.candidate-version }}
+      source-sha: ${{ needs.metadata.outputs.source-sha }}
+    steps:
+      - name: Download exact raw artifact
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093  # v4.3.0
+        with:
+          artifact-ids: ${{ needs.build.outputs.raw-artifact-id }}
+          path: raw
+          merge-multiple: true
+
+      - name: Revalidate inventory and create manifest
+        id: manifest
+        env:
+          SOURCE_SHA: ${{ needs.metadata.outputs.source-sha }}
+          BASE_SHA: ${{ needs.metadata.outputs.base-sha }}
+          BASE_VERSION: ${{ needs.metadata.outputs.base-version }}
+          CANDIDATE_VERSION: ${{ needs.metadata.outputs.candidate-version }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path, PurePosixPath
+          import re
+          import shutil
+          import stat
+
+          root = Path("raw").resolve()
+          dist = root / "dist"
+          if dist.is_symlink() or not dist.is_dir():
+              raise SystemExit("::error::raw dist must be a real directory")
+
+          def regular(path):
+              if path.is_symlink() or not path.is_file() or not stat.S_ISREG(path.stat(follow_symlinks=False).st_mode):
+                  raise SystemExit("::error::publish input is not regular")
+              return path
+
+          document = json.loads(regular(dist / "artifacts.json").read_text())
+          artifacts = document.get("artifacts") if isinstance(document, dict) else document
+          if not isinstance(artifacts, list) or not all(isinstance(item, dict) for item in artifacts):
+              raise SystemExit("::error::invalid artifacts.json")
+          archives = [item for item in artifacts if item.get("type") == "Archive"]
+          checksum_items = [item for item in artifacts if item.get("type") == "Checksum"]
+          if not archives or len(checksum_items) != 1:
+              raise SystemExit("::error::invalid publish inventory")
+
+          def declared_path(item):
+              raw = item.get("path")
+              parts = PurePosixPath(raw).parts if isinstance(raw, str) else ()
+              if len(parts) != 2 or parts[0] != "dist" or any(part in ("", ".", "..") or part.startswith(".") for part in parts):
+                  raise SystemExit("::error::unsafe publish path")
+              return regular(root / Path(*parts))
+
+          archive_paths = [(item, declared_path(item)) for item in archives]
+          checksum_path = declared_path(checksum_items[0])
+          expected = {"artifacts.json", "metadata.json", checksum_path.name, *(path.name for _, path in archive_paths)}
+          actual = {path.name for path in dist.iterdir() if path.is_file() and not path.is_symlink()}
+          if actual != expected or len(list(dist.iterdir())) != len(expected) or len({name.casefold() for name in expected}) != len(expected):
+              raise SystemExit("::error::publish inventory mismatch")
+          checksums = {}
+          for line in checksum_path.read_text().splitlines():
+              match = re.fullmatch(r"([0-9a-fA-F]{64})  ([A-Za-z0-9][A-Za-z0-9._-]*)", line)
+              if not match or match.group(2) in checksums:
+                  raise SystemExit("::error::invalid publish checksum")
+              checksums[match.group(2)] = match.group(1).lower()
+          if set(checksums) != {path.name for _, path in archive_paths}:
+              raise SystemExit("::error::publish checksums are not one-to-one")
+          metadata = json.loads(regular(dist / "metadata.json").read_text())
+          if metadata.get("version") != os.environ["CANDIDATE_VERSION"] or str(metadata.get("commit", "")).lower() != os.environ["SOURCE_SHA"]:
+              raise SystemExit("::error::publish metadata mismatch")
+
+          manifest_archives = []
+          for item, path in sorted(archive_paths, key=lambda pair: pair[1].name):
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              if checksums.get(path.name) != digest:
+                  raise SystemExit("::error::publish archive checksum mismatch")
+              manifest_archives.append({
+                  "file": path.name,
+                  "goarch": item.get("goarch"),
+                  "goos": item.get("goos"),
+                  "name": item.get("name", path.name),
+                  "sha256": digest,
+              })
           stage = Path("candidate-upload")
           if stage.exists():
               shutil.rmtree(stage)
           stage.mkdir()
-          for path in archive_files:
+          for _, path in sorted(archive_paths, key=lambda pair: pair[1].name):
               shutil.copy2(path, stage / path.name)
           shutil.copy2(checksum_path, stage / checksum_path.name)
           manifest = {
-              "schema": 1,
-              "pr": int(os.environ["PR_NUMBER"]),
-              "sha": expected_sha,
-              "base": os.environ["BASE_SHA"].lower(),
+              "archives": manifest_archives,
+              "base": os.environ["BASE_SHA"],
               "base_version": os.environ["BASE_VERSION"],
-              "candidate_version": expected_version,
-              "archives": archive_manifest,
+              "candidate_version": os.environ["CANDIDATE_VERSION"],
+              "pr": int(os.environ["PR_NUMBER"]),
+              "schema": 1,
+              "sha": os.environ["SOURCE_SHA"],
           }
-          manifest_path = stage / "candidate.json"
-          manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
-          expected_staged = seen_names | {checksum_path.name, manifest_path.name}
-          actual_staged = {path.name for path in stage.iterdir() if path.is_file() and not path.is_symlink()}
-          if actual_staged != expected_staged or len(list(stage.iterdir())) != len(expected_staged):
-              raise SystemExit("::error::staged files do not exactly match archives, checksums, and manifest")
+          (stage / "candidate.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+          expected_stage = {path.name for _, path in archive_paths} | {checksum_path.name, "candidate.json"}
+          if {path.name for path in stage.iterdir()} != expected_stage or any(path.is_symlink() or not path.is_file() for path in stage.iterdir()):
+              raise SystemExit("::error::final stage allowlist mismatch")
+          artifact_name = f"go-candidate-pr-{os.environ['PR_NUMBER']}-{os.environ['SOURCE_SHA']}"
           with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
-              print(f"smoke_binary={smoke_binary}", file=output)
+              print(f"artifact_name={artifact_name}", file=output)
           PY
 
-      - name: Smoke test linux amd64 candidate
-        env:
-          SMOKE_BINARY: ${{ steps.candidate.outputs.smoke_binary }}
-          SOURCE_SHA: ${{ inputs.source-sha }}
-          CANDIDATE_VERSION: ${{ steps.source.outputs.candidate_version }}
-        run: |
-          if [[ ! -x "$SMOKE_BINARY" ]]; then
-            echo "::error::Extracted candidate is not executable"
-            exit 1
-          fi
-          build_info=$(go version -m "$SMOKE_BINARY")
-          revision=$(printf '%s\n' "$build_info" | sed -nE 's/^[[:space:]]*build[[:space:]]+vcs\.revision=(.*)$/\1/p')
-          if [[ "${revision,,}" != "${SOURCE_SHA,,}" ]]; then
-            echo "::error::Binary vcs.revision '$revision' does not equal source SHA '$SOURCE_SHA'"
-            exit 1
-          fi
-          version_output=$("$SMOKE_BINARY" --version 2>&1)
-          if [[ "$version_output" != *"$CANDIDATE_VERSION"* ]]; then
-            echo "::error::Binary --version does not contain candidate version"
-            exit 1
-          fi
-          if [[ "${version_output,,}" == *dev* ]]; then
-            echo "::error::Binary --version contains dev"
-            exit 1
-          fi
-
-      - name: Upload candidate artifacts
+      - name: Upload final validated candidate
+        id: final
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
         with:
-          name: go-candidate-pr-${{ inputs.pr-number }}-${{ inputs.source-sha }}
+          name: ${{ steps.manifest.outputs.artifact_name }}
           path: candidate-upload/
+          compression-level: 0
+          include-hidden-files: false
           retention-days: 7
+          overwrite: false
           if-no-files-found: error

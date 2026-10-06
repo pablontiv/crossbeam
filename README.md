@@ -159,20 +159,18 @@ jobs:
 
 ### Go PR candidate artifacts
 
-`go-candidate.yml` is an opt-in `workflow_call` for building a pre-release from an exact PR commit. The caller owns the event trigger, job-level `if`, and `needs`; Crossbeam does not decide which PRs produce artifacts.
+`go-candidate.yml` is an opt-in `workflow_call` for public Go repositories. The caller owns the trigger, job-level `if`, and `needs`, and must pin Crossbeam to a full commit SHA rather than a movable tag.
 
-Required inputs are `source-repository`, `source-sha` (40 hexadecimal characters), `base-sha` (40 hexadecimal characters), positive `pr-number`, and non-empty `binary-name`. Optional `go-version-file` and `goreleaser-config` default to `go.mod` and `.goreleaser.yml`; both must be safe relative regular-file paths. The Go version file must select an exact patch release such as `1.24.1` (including an exact `go 1.24.1` directive).
-
-The caller grants only `contents: read` and `pull-requests: read`. The workflow uses the token solely to read the numbered PR from the caller repository and requires exact API agreement for the head repository, head SHA, and base SHA. If the PR base changes, regenerate the candidate with the new `base-sha`; stale inputs fail closed.
-
-The consuming repository must use this exact GoReleaser snapshot template:
+Required inputs are `source-repository`, 40-hex `source-sha`, 40-hex `base-sha`, positive `pr-number`, `binary-name`, and an exact trusted Go patch in `go-version` (for example `1.24.1`). `goreleaser-config` defaults to `.goreleaser.yml`; it is always read from the caller repository at `base-sha`, never from the PR checkout. The trusted config must retain this snapshot template:
 
 ```yaml
 snapshot:
   version_template: "{{ incpatch .Version }}-pr.{{ .Env.PR_NUMBER }}.g{{ .ShortCommit }}"
 ```
 
-Always build after the caller's required checks. A mandatory candidate on every PR can be wired as follows:
+The PR must be rebased so `base-sha` is an ancestor of `source-sha`. If the base branch changes, regenerate the candidate with the new base SHA.
+
+Mandatory PR candidates can be wired after caller checks:
 
 ```yaml
 on:
@@ -180,13 +178,12 @@ on:
 
 jobs:
   test:
-    uses: pablontiv/crossbeam/.github/workflows/go-ci.yml@v1
+    uses: pablontiv/crossbeam/.github/workflows/go-ci.yml@<40-character-crossbeam-sha>
 
   candidate:
     needs: [test]
-    uses: pablontiv/crossbeam/.github/workflows/go-candidate.yml@v1
+    uses: pablontiv/crossbeam/.github/workflows/go-candidate.yml@<40-character-crossbeam-sha>
     permissions:
-      contents: read
       pull-requests: read
     with:
       source-repository: ${{ github.event.pull_request.head.repo.full_name }}
@@ -194,9 +191,10 @@ jobs:
       base-sha: ${{ github.event.pull_request.base.sha }}
       pr-number: ${{ github.event.pull_request.number }}
       binary-name: my-tool
+      go-version: 1.24.1
 ```
 
-For a manual candidate, expose typed `workflow_dispatch` inputs and pass them through explicitly:
+A manual caller passes the same immutable PR identity explicitly:
 
 ```yaml
 on:
@@ -209,9 +207,8 @@ on:
 
 jobs:
   candidate:
-    uses: pablontiv/crossbeam/.github/workflows/go-candidate.yml@v1
+    uses: pablontiv/crossbeam/.github/workflows/go-candidate.yml@<40-character-crossbeam-sha>
     permissions:
-      contents: read
       pull-requests: read
     with:
       source-repository: ${{ inputs.source-repository }}
@@ -219,9 +216,10 @@ jobs:
       base-sha: ${{ inputs.base-sha }}
       pr-number: ${{ inputs.pr-number }}
       binary-name: my-tool
+      go-version: 1.24.1
 ```
 
-To make creation label-controlled, keep the policy in the caller job:
+For label-controlled publication, keep policy and dependencies in the caller:
 
 ```yaml
 on:
@@ -230,14 +228,13 @@ on:
 
 jobs:
   test:
-    uses: pablontiv/crossbeam/.github/workflows/go-ci.yml@v1
+    uses: pablontiv/crossbeam/.github/workflows/go-ci.yml@<40-character-crossbeam-sha>
 
   candidate:
     if: contains(github.event.pull_request.labels.*.name, 'candidate')
     needs: [test]
-    uses: pablontiv/crossbeam/.github/workflows/go-candidate.yml@v1
+    uses: pablontiv/crossbeam/.github/workflows/go-candidate.yml@<40-character-crossbeam-sha>
     permissions:
-      contents: read
       pull-requests: read
     with:
       source-repository: ${{ github.event.pull_request.head.repo.full_name }}
@@ -245,11 +242,20 @@ jobs:
       base-sha: ${{ github.event.pull_request.base.sha }}
       pr-number: ${{ github.event.pull_request.number }}
       binary-name: my-tool
+      go-version: 1.24.1
 ```
 
-The workflow checks out and deepens the exact public fork SHA without credentials, discards fork tags, and imports only exact stable `vN.N.N` tags from the caller repository. Its token is confined to PR API validation under `contents: read` and `pull-requests: read`; checkout, build, and GoReleaser receive no token or secrets. It performs no push, tag, release, write, or OIDC operation. GoReleaser runs a clean snapshot; confined artifact paths, metadata, one-to-one checksums, manifest, embedded revision, and binary version are validated before only archives, checksums, and `candidate.json` are uploaded for seven days.
+The workflow isolates trust boundaries across fresh jobs:
 
-This workflow intentionally executes code supplied by the fork. The runner is ephemeral and has no persisted checkout credentials or build secrets, which limits repository compromise, but untrusted build code can still use runner CPU/network and observe public workflow context. Callers should keep the job secret-free, apply their own approval or label policy, and never add privileged credentials to it.
+1. `metadata` reads only the PR API and the public caller Git graph.
+2. `build` has no repository permission, installs the exact Go toolchain and GoReleaser before fetching source, uses only the base-SHA GoReleaser config, and uploads one bounded raw artifact.
+3. `static-validate` downloads that exact artifact ID and inspects metadata, checksums, platform matrix, Go build information, and every archive member without executing the candidate.
+4. `smoke` downloads the same artifact ID, safely materializes only the Linux/amd64 binary, and executes it as the final step under an empty environment and temporary HOME/XDG/database paths.
+5. `publish` runs fresh only after static validation and smoke succeed, downloads the same immutable raw artifact, regenerates `candidate.json`, and uploads the final allowlisted artifact.
+
+Top-level permissions are empty. Only `metadata` receives `pull-requests: read`; the API token is scoped to its validation step. Source fetches are anonymous HTTPS and initial support is therefore limited to public repositories. No workflow secret, OIDC permission, write permission, tag, release, or persisted Git credential is used. GitHub artifact/setup actions may use Actions-internal runtime tokens inside their host actions; those tokens are not passed to the candidate process or GoReleaser CLI.
+
+The workflow deliberately builds and smoke-tests untrusted fork code. Fresh runners prevent build persistence from reaching validation or publication, and the candidate executes without credentials in a temporary local environment. It can still consume runner CPU and use unauthenticated network access. No candidate artifact is installed or published unless the complete DAG succeeds and the isolated local smoke verification passes.
 
 ---
 
