@@ -33,6 +33,27 @@ PY
   chmod +x "$TEST_ROOT/compute-tag.sh"
 }
 
+extract_smoke_script() {
+  python3 - "$WORKFLOW" "$TEST_ROOT/smoke-test.sh" <<'PY'
+from pathlib import Path
+import sys
+
+workflow = Path(sys.argv[1]).read_text().splitlines()
+output = Path(sys.argv[2])
+
+step = next(i for i, line in enumerate(workflow) if line == "      - name: Smoke test binary")
+run = next(i for i in range(step + 1, len(workflow)) if workflow[i] == "        run: |")
+
+body = []
+for line in workflow[run + 1:]:
+    if line and not line.startswith("          "):
+        break
+    body.append(line[10:] if line else "")
+
+output.write_text("\n".join(body) + "\n")
+PY
+}
+
 record() {
   local name=$1 expected=$2 actual=$3
   if [[ "$actual" == "$expected" ]]; then
@@ -160,7 +181,192 @@ PY
     "if: needs.auto-tag.outputs.created == 'true'" "$condition"
 }
 
+make_test_binary() {
+  local repo=$1 path=$2 mode=$3
+  mkdir -p "$(dirname "$repo/$path")"
+  cat > "$repo/$path" <<'SH'
+#!/usr/bin/env bash
+set -u
+mode=$(cat "$0.mode")
+printf '%s %s\n' "$0" "${1-}" >> "$INVOCATION_LOG"
+case "$mode:${1-}" in
+  version-flag:--version|fallback:version) exit 0 ;;
+  *) exit 1 ;;
+esac
+SH
+  printf '%s\n' "$mode" > "$repo/$path.mode"
+}
+
+run_smoke_case() {
+  local name=$1 repo=$2 binary_name=$3 expected=$4
+  local status=0
+  local invocation_log="$repo/invocations.log"
+  local run_log="$repo/smoke.log"
+  : > "$invocation_log"
+
+  (
+    cd "$repo"
+    BINARY_NAME="$binary_name" INVOCATION_LOG="$invocation_log" \
+      bash "$TEST_ROOT/smoke-test.sh"
+  ) >"$run_log" 2>&1 || status=$?
+
+  local actual=success
+  (( status == 0 )) || actual=failure
+  record "$name" "$expected" "$actual"
+}
+
+assert_smoke_darwin_first_linux_selected() {
+  local repo="$TEST_ROOT/smoke-platform-selection"
+  mkdir -p "$repo/dist"
+  make_test_binary "$repo" "dist/tool_darwin_arm64/tool" both-fail
+  make_test_binary "$repo" "dist/tool_linux_amd64/tool" version-flag
+  cat > "$repo/dist/artifacts.json" <<'JSON'
+[
+  {"type":"Binary","name":"tool","goos":"darwin","goarch":"arm64","path":"dist/tool_darwin_arm64/tool"},
+  {"type":"Binary","name":"tool","goos":"linux","goarch":"amd64","path":"dist/tool_linux_amd64/tool"}
+]
+JSON
+
+  run_smoke_case "smoke selects Linux when Darwin is first" "$repo" tool success
+  local selected
+  selected=$(sed 's/.*dist\///' "$repo/invocations.log")
+  record "smoke executes selected Linux artifact" "tool_linux_amd64/tool --version" "$selected"
+}
+
+assert_smoke_version_flag_succeeds() {
+  local repo="$TEST_ROOT/smoke-version-flag"
+  mkdir -p "$repo/dist"
+  make_test_binary "$repo" "dist/tool_linux_amd64/tool" version-flag
+  cat > "$repo/dist/artifacts.json" <<'JSON'
+[{"type":"Binary","name":"tool","goos":"linux","goarch":"amd64","path":"dist/tool_linux_amd64/tool"}]
+JSON
+
+  run_smoke_case "smoke accepts --version" "$repo" tool success
+  local arguments
+  arguments=$(sed 's/.* //' "$repo/invocations.log" | paste -sd, -)
+  record "successful --version does not use fallback" "--version" "$arguments"
+}
+
+assert_smoke_version_fallback_succeeds() {
+  local repo="$TEST_ROOT/smoke-version-fallback"
+  mkdir -p "$repo/dist"
+  make_test_binary "$repo" "dist/tool_linux_amd64/tool" fallback
+  cat > "$repo/dist/artifacts.json" <<'JSON'
+[{"type":"Binary","name":"tool","goos":"linux","goarch":"amd64","path":"dist/tool_linux_amd64/tool"}]
+JSON
+
+  run_smoke_case "smoke accepts version fallback" "$repo" tool success
+  local arguments
+  arguments=$(sed 's/.* //' "$repo/invocations.log" | paste -sd, -)
+  record "fallback runs after failed --version" "--version,version" "$arguments"
+}
+
+assert_smoke_both_version_commands_fail() {
+  local repo="$TEST_ROOT/smoke-both-fail"
+  mkdir -p "$repo/dist"
+  make_test_binary "$repo" "dist/tool_linux_amd64/tool" both-fail
+  cat > "$repo/dist/artifacts.json" <<'JSON'
+[{"type":"Binary","name":"tool","goos":"linux","goarch":"amd64","path":"dist/tool_linux_amd64/tool"}]
+JSON
+
+  run_smoke_case "smoke fails when both version commands fail" "$repo" tool failure
+}
+
+assert_smoke_zero_matches_fails() {
+  local repo="$TEST_ROOT/smoke-zero-match"
+  mkdir -p "$repo/dist"
+  make_test_binary "$repo" "dist/tool_darwin_arm64/tool" version-flag
+  cat > "$repo/dist/artifacts.json" <<'JSON'
+[{"type":"Binary","name":"tool","goos":"darwin","goarch":"arm64","path":"dist/tool_darwin_arm64/tool"}]
+JSON
+
+  run_smoke_case "smoke fails with zero matching artifacts" "$repo" tool failure
+}
+
+assert_smoke_multiple_matches_fail() {
+  local repo="$TEST_ROOT/smoke-multiple-matches"
+  mkdir -p "$repo/dist"
+  make_test_binary "$repo" "dist/tool_linux_amd64_a/tool" version-flag
+  make_test_binary "$repo" "dist/tool_linux_amd64_b/tool" version-flag
+  cat > "$repo/dist/artifacts.json" <<'JSON'
+[
+  {"type":"Binary","name":"tool","goos":"linux","goarch":"amd64","path":"dist/tool_linux_amd64_a/tool"},
+  {"type":"Binary","name":"tool","goos":"linux","goarch":"amd64","path":"dist/tool_linux_amd64_b/tool"}
+]
+JSON
+
+  run_smoke_case "smoke fails with multiple matching artifacts" "$repo" tool failure
+}
+
+assert_smoke_missing_path_fails() {
+  local repo="$TEST_ROOT/smoke-missing-path"
+  mkdir -p "$repo/dist"
+  cat > "$repo/dist/artifacts.json" <<'JSON'
+[{"type":"Binary","name":"tool","goos":"linux","goarch":"amd64"}]
+JSON
+
+  run_smoke_case "smoke fails when artifact path is absent" "$repo" tool failure
+}
+
+assert_smoke_missing_file_fails() {
+  local repo="$TEST_ROOT/smoke-missing-file"
+  mkdir -p "$repo/dist"
+  cat > "$repo/dist/artifacts.json" <<'JSON'
+[{"type":"Binary","name":"tool","goos":"linux","goarch":"amd64","path":"dist/not-created/tool"}]
+JSON
+
+  run_smoke_case "smoke fails when artifact file is absent" "$repo" tool failure
+}
+
+assert_smoke_outside_dist_fails() {
+  local repo="$TEST_ROOT/smoke-outside-dist"
+  mkdir -p "$repo/dist"
+  make_test_binary "$repo" tool version-flag
+  cat > "$repo/dist/artifacts.json" <<'JSON'
+[{"type":"Binary","name":"tool","goos":"linux","goarch":"amd64","path":"tool"}]
+JSON
+
+  run_smoke_case "smoke rejects artifact outside dist" "$repo" tool failure
+}
+
+assert_smoke_missing_manifest_fails() {
+  local repo="$TEST_ROOT/smoke-missing-manifest"
+  mkdir -p "$repo/dist"
+  run_smoke_case "smoke fails when manifest is absent" "$repo" tool failure
+}
+
+assert_smoke_invalid_manifest_fails() {
+  local repo="$TEST_ROOT/smoke-invalid-manifest"
+  mkdir -p "$repo/dist"
+  printf '%s\n' 'not json' > "$repo/dist/artifacts.json"
+  run_smoke_case "smoke fails when manifest is invalid" "$repo" tool failure
+}
+
+assert_empty_binary_name_preserves_static_skip() {
+  local metadata condition env_value
+  metadata=$(python3 - "$WORKFLOW" <<'PY'
+from pathlib import Path
+import sys
+
+lines = Path(sys.argv[1]).read_text().splitlines()
+step = next(i for i, line in enumerate(lines) if line == "      - name: Smoke test binary")
+end = next(
+    (i for i in range(step + 1, len(lines)) if lines[i].startswith("      - name:")),
+    len(lines),
+)
+block = lines[step:end]
+print(next(line.strip() for line in block if line.strip().startswith("if:")))
+print(next(line.strip() for line in block if line.strip().startswith("BINARY_NAME:")))
+PY
+)
+  condition=$(printf '%s\n' "$metadata" | sed -n '1p')
+  env_value=$(printf '%s\n' "$metadata" | sed -n '2p')
+  record "empty binary-name preserves static skip" "if: inputs.binary-name != ''" "$condition"
+  record "binary-name is passed through env" 'BINARY_NAME: ${{ inputs.binary-name }}' "$env_value"
+}
+
 extract_release_script
+extract_smoke_script
 
 echo "=== Post-1.0 policy ==="
 run_case "breaking defaults to minor" v2.3.4 5 "" v2.4.0 true feat \
@@ -215,6 +421,21 @@ echo ""
 echo "=== Validation and downstream gating ==="
 assert_invalid_force_bump_fails
 assert_release_job_skips_without_created_tag
+
+echo ""
+echo "=== Go release binary smoke test ==="
+assert_smoke_darwin_first_linux_selected
+assert_smoke_version_flag_succeeds
+assert_smoke_version_fallback_succeeds
+assert_smoke_both_version_commands_fail
+assert_smoke_zero_matches_fails
+assert_smoke_multiple_matches_fail
+assert_smoke_missing_path_fails
+assert_smoke_missing_file_fails
+assert_smoke_outside_dist_fails
+assert_smoke_missing_manifest_fails
+assert_smoke_invalid_manifest_fails
+assert_empty_binary_name_preserves_static_skip
 
 echo ""
 printf 'Results: %d passed, %d failed\n' "$PASS" "$FAIL"
