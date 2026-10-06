@@ -336,11 +336,12 @@ for goos, goarch in platforms:
             elif is_primary and mode == "unicode-c1-9b": add_tar(bundle, "tool", payload, 0o755); add_tar(bundle, "README.md", "text\u009bcontrol".encode(), 0o644)
             elif is_primary and mode == "unicode-bidi-202e": add_tar(bundle, "tool", payload, 0o755); add_tar(bundle, "README.md", "text\u202eformat".encode(), 0o644)
             elif is_primary and mode == "unicode-bidi-2066": add_tar(bundle, "tool", payload, 0o755); add_tar(bundle, "README.md", "text\u2066format".encode(), 0o644)
+            elif is_primary and mode == "unicode-embedded-bom": add_tar(bundle, "tool", payload, 0o755); add_tar(bundle, "README.md", "text\ufeffembedded".encode(), 0o644)
             else:
                 add_tar(bundle, expected_binary, payload, 0o755)
                 docs = b"representative backscroll docs" if goos == "linux" else b"representative rootline docs"
                 add_tar(bundle, "LICENSE", docs, 0o644)
-                if goarch == "amd64": add_tar(bundle, "README.md", "Documentación segura — español".encode(), 0o644)
+                if goarch == "amd64": add_tar(bundle, "README.md", "\ufeffمتن فارسی\u200c و emoji 👩\u200d💻".encode(), 0o644)
     archives.append({"type": "Archive", "name": archive_name, "path": f"dist/{archive_name}", "goos": goos, "goarch": goarch})
 
 primary_tar = dist / "tool_linux_amd64.tar.gz"
@@ -491,6 +492,7 @@ run_static_case() {
     bash -c "cd '$dir' && '$TEST_ROOT/static.sh'"
 }
 run_static_case "direct-list six-target TAR and ZIP archives pass" valid success
+run_static_case "leading BOM Persian ZWNJ and emoji ZWJ documentation pass" unicode-legitimate success
 run_static_case "archive traversal rejected" traversal failure
 run_static_case "absolute archive member rejected" absolute failure
 run_static_case "backslash archive member rejected" backslash failure
@@ -532,6 +534,7 @@ run_static_case "Unicode C1 U+0085 rejected" unicode-c1-85 failure
 run_static_case "Unicode C1 U+009B rejected" unicode-c1-9b failure
 run_static_case "Unicode bidi U+202E rejected" unicode-bidi-202e failure
 run_static_case "Unicode bidi U+2066 rejected" unicode-bidi-2066 failure
+run_static_case "embedded Unicode BOM U+FEFF rejected" unicode-embedded-bom failure
 run_static_case "Windows malware exe rejected even non-executable" windows-malware-exe failure
 run_static_case "Windows malware dll rejected even non-executable" windows-malware-dll failure
 run_static_case "Windows malware cmd rejected even non-executable" windows-malware-cmd failure
@@ -597,24 +600,56 @@ for line in (dist / "checksums.txt").read_text().splitlines():
 (dist / "checksums.txt").write_text("\n".join(lines) + "\n")
 PY
 extract_output="$smoke_dir/extract-output"
-if [[ "$(uname -s)" == Linux ]] && command -v sudo >/dev/null && sudo -n -u nobody true >/dev/null 2>&1 && [[ -x /usr/bin/timeout ]]; then
-  smoke_runner_temp="$smoke_dir/runner-temp"
-  mkdir -p "$smoke_runner_temp"
-  expect_status "safe smoke extraction creates nobody-owned sandbox" success "$smoke_dir/extract.log" \
-    env BINARY_NAME=tool GITHUB_OUTPUT="$extract_output" RUNNER_TEMP="$smoke_runner_temp" \
-    bash -c "cd '$smoke_dir' && '$TEST_ROOT/extract.sh'"
-  sandbox=$(sed -n 's/^sandbox=//p' "$extract_output")
-  binary=$(sed -n 's/^binary=//p' "$extract_output")
-  record "smoke binary is owned by nobody" nobody "$(stat -c '%U' "$binary")"
-  expect_status "isolated candidate smoke succeeds as nobody" success "$smoke_dir/smoke.log" \
-    env SANDBOX="$sandbox" SMOKE_BINARY="$binary" CANDIDATE_VERSION="$candidate_version" \
-    "$TEST_ROOT/smoke.sh"
-  expect_status "smoke version failure blocks success" failure "$smoke_dir/smoke-fail.log" \
-    env SANDBOX="$sandbox" SMOKE_BINARY="$binary" CANDIDATE_VERSION=9.9.9-bad \
-    "$TEST_ROOT/smoke.sh"
+if [[ "$(uname -s)" == Linux ]]; then
+  linux_ready=true
+  id nobody >/dev/null 2>&1 || linux_ready=false
+  [[ -x /usr/bin/sudo && -x /usr/bin/env && -x /usr/bin/timeout \
+    && -x /usr/bin/pkill && -x /usr/bin/pgrep ]] || linux_ready=false
+  /usr/bin/sudo -n -u nobody true >/dev/null 2>&1 || linux_ready=false
+  if [[ "$linux_ready" != true ]]; then
+    record "Linux smoke isolation prerequisites are mandatory" available unavailable
+  else
+    smoke_runner_temp="$smoke_dir/runner-temp"
+    mkdir -p "$smoke_runner_temp"
+    prepare_smoke() {
+      local label=$1
+      extract_output="$smoke_dir/extract-${label}.output"
+      : > "$extract_output"
+      expect_status "safe smoke extraction for $label" success "$smoke_dir/extract-${label}.log" \
+        env BINARY_NAME=tool GITHUB_OUTPUT="$extract_output" RUNNER_TEMP="$smoke_runner_temp" \
+        bash -c "cd '$smoke_dir' && '$TEST_ROOT/extract.sh'"
+      sandbox=$(sed -n 's/^sandbox=//p' "$extract_output")
+      binary=$(sed -n 's/^binary=//p' "$extract_output")
+    }
 
-  malicious="$smoke_dir/proc-environ-probe"
-  cat > "$malicious" <<PROBE
+    before_sandboxes=$(find /var/tmp -maxdepth 1 -type d -name 'go-candidate-smoke.*' -print | sort)
+    expect_status "failed preparation triggers partial sandbox cleanup" failure "$smoke_dir/partial-cleanup.log" \
+      env BINARY_NAME=tool GITHUB_OUTPUT=/dev/full RUNNER_TEMP="$smoke_runner_temp" \
+      bash -c "cd '$smoke_dir' && '$TEST_ROOT/extract.sh'"
+    after_sandboxes=$(find /var/tmp -maxdepth 1 -type d -name 'go-candidate-smoke.*' -print | sort)
+    record "partial preparation leaves no sandbox" "$before_sandboxes" "$after_sandboxes"
+    remaining_staged=$(find "$smoke_runner_temp" -maxdepth 1 -name 'candidate-smoke-*' -print -quit)
+    record "partial preparation removes staged binary" absent "$([[ -n "$remaining_staged" ]] && echo present || echo absent)"
+
+    prepare_smoke success
+    success_sandbox=$sandbox
+    record "smoke binary is owned by nobody" nobody "$(stat -c '%U' "$binary")"
+    expect_status "isolated candidate smoke succeeds as nobody" success "$smoke_dir/smoke.log" \
+      env SANDBOX="$sandbox" SMOKE_BINARY="$binary" CANDIDATE_VERSION="$candidate_version" \
+      "$TEST_ROOT/smoke.sh"
+    record "successful smoke removes sandbox" absent "$([[ -e "$success_sandbox" ]] && echo present || echo absent)"
+
+    prepare_smoke failure
+    failure_sandbox=$sandbox
+    expect_status "smoke version failure blocks success" failure "$smoke_dir/smoke-fail.log" \
+      env SANDBOX="$sandbox" SMOKE_BINARY="$binary" CANDIDATE_VERSION=9.9.9-bad \
+      "$TEST_ROOT/smoke.sh"
+    record "failed smoke removes sandbox" absent "$([[ -e "$failure_sandbox" ]] && echo present || echo absent)"
+
+    prepare_smoke probe
+    probe_sandbox=$sandbox
+    malicious="$smoke_dir/proc-environ-probe"
+    cat > "$malicious" <<PROBE
 #!/bin/sh
 pid=\$PPID
 while [ "\$pid" -gt 1 ] 2>/dev/null; do
@@ -626,14 +661,57 @@ while [ "\$pid" -gt 1 ] 2>/dev/null; do
 done
 printf '%s\n' 'tool $candidate_version'
 PROBE
-  sudo -n install -o nobody -g "$(id -gn nobody)" -m 0500 "$malicious" "$sandbox/probe"
-  expect_status "malicious candidate cannot read sentinel from ancestor environments" success "$smoke_dir/probe.log" \
-    env SMOKE_SENTINEL_SECRET=must-not-leak SANDBOX="$sandbox" SMOKE_BINARY="$sandbox/probe" \
-    CANDIDATE_VERSION="$candidate_version" "$TEST_ROOT/smoke.sh"
+    sudo -n install -o nobody -g "$(id -gn nobody)" -m 0500 "$malicious" "$sandbox/candidate"
+    expect_status "malicious candidate cannot read sentinel from ancestor environments" success "$smoke_dir/probe.log" \
+      env SMOKE_SENTINEL_SECRET=must-not-leak SANDBOX="$sandbox" SMOKE_BINARY="$sandbox/candidate" \
+      CANDIDATE_VERSION="$candidate_version" "$TEST_ROOT/smoke.sh"
+    record "probe smoke removes sandbox" absent "$([[ -e "$probe_sandbox" ]] && echo present || echo absent)"
+
+    prepare_smoke sigstop
+    sigstop_sandbox=$sandbox
+    sigstop_candidate="$smoke_dir/sigstop-parent"
+    cat > "$sigstop_candidate" <<STOPPER
+#!/bin/sh
+kill -STOP "\$PPID" 2>/dev/null || true
+printf '%s\n' 'tool $candidate_version'
+STOPPER
+    /usr/bin/sudo -n install -o nobody -g "$(id -gn nobody)" -m 0500 "$sigstop_candidate" "$sandbox/candidate"
+    expect_status "candidate cannot stop outer watchdog via parent SIGSTOP" success "$smoke_dir/sigstop.log" \
+      env SANDBOX="$sandbox" SMOKE_BINARY="$sandbox/candidate" CANDIDATE_VERSION="$candidate_version" \
+      "$TEST_ROOT/smoke.sh"
+    record "SIGSTOP probe removes sandbox" absent "$([[ -e "$sigstop_sandbox" ]] && echo present || echo absent)"
+
+    prepare_smoke ignore-term
+    ignore_sandbox=$sandbox
+    ignore_candidate="$smoke_dir/ignore-term"
+    cat > "$ignore_candidate" <<'IGNORER'
+#!/bin/sh
+if [ "${1:-}" = child ]; then
+  trap '' TERM
+  while :; do sleep 1; done
+fi
+"$0" child &
+trap '' TERM
+while :; do sleep 1; done
+IGNORER
+    /usr/bin/sudo -n install -o nobody -g "$(id -gn nobody)" -m 0500 "$ignore_candidate" "$sandbox/candidate"
+    started=$SECONDS
+    expect_status "SIGTERM-ignoring candidate is forcibly bounded" failure "$smoke_dir/ignore-term.log" \
+      env SANDBOX="$sandbox" SMOKE_BINARY="$sandbox/candidate" CANDIDATE_VERSION="$candidate_version" \
+      "$TEST_ROOT/smoke.sh"
+    elapsed=$((SECONDS - started))
+    if (( elapsed <= 20 )); then
+      actual_bound=bounded
+    else
+      actual_bound="${elapsed}s"
+    fi
+    record "TERM-ignoring runtime stays bounded" bounded "$actual_bound"
+    record "watchdog cleanup kills candidate descendants" absent \
+      "$(/usr/bin/pgrep -f -- "$ignore_sandbox/candidate child" >/dev/null && echo present || echo absent)"
+    record "TERM-ignoring smoke removes sandbox" absent "$([[ -e "$ignore_sandbox" ]] && echo present || echo absent)"
+  fi
 else
-  record "dynamic nobody smoke requires Linux passwordless sudo" skipped skipped
-  record "dynamic ancestor environ probe requires Linux procfs" skipped skipped
-  record "dynamic timeout smoke requires ubuntu coreutils" skipped skipped
+  printf '  SKIP: dynamic nobody smoke and procfs probe require Linux\n'
 fi
 record "failed smoke creates no final staging" absent "$([[ -e "$smoke_dir/candidate-upload" ]] && echo present || echo absent)"
 python3 - "$smoke_dir/raw/dist/artifacts.json" <<'PY'
@@ -697,7 +775,9 @@ static_result=$(python3 - "$WORKFLOW" <<'PY'
 from pathlib import Path
 import re
 import sys
-text = Path(sys.argv[1]).read_text()
+workflow_path = Path(sys.argv[1])
+text = workflow_path.read_text()
+ci_text = (workflow_path.parent / "ci.yml").read_text()
 smoke_job = text.split("  smoke:\n", 1)[1].split("\n  publish:\n", 1)[0]
 execute_section = smoke_job.split("      - name: Execute candidate in empty environment\n", 1)[1]
 checks = {
@@ -715,10 +795,14 @@ checks = {
     "PR config never selected": "go-version-file" not in text and "inputs.goreleaser-config }}" not in text.split("Build candidate with sanitized environment", 1)[1],
     "goreleaser action install only": "install-only: true" in text,
     "smoke execution is last": "\n      - name:" not in execute_section,
-    "smoke uses distinct nobody UID": "sudo -n -u nobody -- /usr/bin/env -i" in execute_section,
-    "timeout is inside sanitized command": execute_section.index("/usr/bin/env -i") < execute_section.index("/usr/bin/timeout 30s"),
+    "smoke uses distinct nobody UID": "/usr/bin/sudo -n -u nobody -- /usr/bin/env -i" in execute_section,
+    "watchdog precedes adversarial UID": execute_section.index("/usr/bin/timeout --signal=TERM --kill-after=2s 10s") < execute_section.index("/usr/bin/sudo -n -u nobody") < execute_section.index("/usr/bin/env -i"),
+    "smoke has outer job timeout": "timeout-minutes: 10" in smoke_job,
     "smoke receives no runtime credentials": all(value not in execute_section for value in ("ACTIONS_", "github.token", "GITHUB_TOKEN", "GH_TOKEN")),
     "sandbox leaves runner-owned ancestry": "mktemp -d /var/tmp/go-candidate-smoke.XXXXXX" in smoke_job and 'install -o "$smoke_user"' in smoke_job,
+    "preparation cleanup is armed then disarmed": "trap cleanup_preparation EXIT" in smoke_job and "trap - EXIT" in smoke_job,
+    "smoke always cleans sandbox and descendants": "trap cleanup_sandbox EXIT" in execute_section and "/usr/bin/pkill -KILL -u nobody" in execute_section,
+    "CI runs candidate tests on Ubuntu": "runs-on: ubuntu-latest" in ci_text and "bash scripts/test-go-candidate.sh" in ci_text,
 }
 uses = re.findall(r"(?m)^\s*uses:\s*([^\s#]+)", text)
 checks["actions pinned"] = bool(uses) and all(re.fullmatch(r"[^@]+@[0-9a-f]{40}", use) for use in uses)

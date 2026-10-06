@@ -604,11 +604,15 @@ jobs:
               if len(data) > MAX_DOCUMENT:
                   raise SystemExit("::error::documentation payload exceeds size limit")
               try:
-                  text = data.decode("utf-8")
+                  text = data.decode("utf-8-sig")
               except UnicodeDecodeError:
                   raise SystemExit("::error::documentation payload is not UTF-8")
-              if any(unicodedata.category(char) in ("Cc", "Cf") and char not in "\t\n\r" for char in text):
-                  raise SystemExit("::error::documentation payload contains Unicode control or format characters")
+              for char in text:
+                  category = unicodedata.category(char)
+                  if category == "Cc" and char not in "\t\n\r":
+                      raise SystemExit("::error::documentation payload contains a Unicode control character")
+                  if category == "Cf" and char not in ("\u200c", "\u200d"):
+                      raise SystemExit("::error::documentation payload contains a disallowed Unicode format character")
 
           def validate_members(records, archive_size, expected_binary):
               if not 1 <= len(records) <= MAX_ENTRIES:
@@ -916,6 +920,7 @@ jobs:
     name: Isolated linux amd64 smoke
     needs: [metadata, build, static-validate]
     runs-on: ubuntu-24.04
+    timeout-minutes: 10
     permissions: {}
     steps:
       - name: Download exact raw artifact
@@ -1021,18 +1026,44 @@ jobs:
                           read_exact(stream, padding)
           if len(payloads) != 1:
               raise SystemExit("::error::exact root smoke binary is absent or ambiguous")
-          with tempfile.NamedTemporaryFile(prefix="candidate-smoke-staged-", dir=os.environ["RUNNER_TEMP"], delete=False) as staged:
-              staged.write(payloads[0])
-              staged_binary = Path(staged.name)
-          staged_binary.chmod(0o600)
-          (Path(os.environ["RUNNER_TEMP"]) / "candidate-smoke-stage-path").write_text(str(staged_binary))
+          staged_binary = None
+          stage_path = Path(os.environ["RUNNER_TEMP"]) / "candidate-smoke-stage-path"
+          try:
+              with tempfile.NamedTemporaryFile(prefix="candidate-smoke-staged-", dir=os.environ["RUNNER_TEMP"], delete=False) as staged:
+                  staged.write(payloads[0])
+                  staged_binary = Path(staged.name)
+              staged_binary.chmod(0o600)
+              stage_path.write_text(str(staged_binary))
+          except BaseException:
+              if staged_binary is not None:
+                  staged_binary.unlink(missing_ok=True)
+              stage_path.unlink(missing_ok=True)
+              raise
           PY
+          staged_binary=
+          sandbox=
+          cleanup_preparation() {
+            status=$?
+            trap - EXIT
+            rm -f "${staged_binary:-}" "$RUNNER_TEMP/candidate-smoke-stage-path"
+            if [[ -n "${sandbox:-}" && "$sandbox" =~ ^/var/tmp/go-candidate-smoke\.[A-Za-z0-9]{6}$ ]]; then
+              if ! sudo -n rm -rf -- "$sandbox"; then
+                exit 1
+              fi
+            fi
+            exit "$status"
+          }
+          trap cleanup_preparation EXIT
           staged_binary=$(cat "$RUNNER_TEMP/candidate-smoke-stage-path")
           smoke_user=nobody
           smoke_group=$(id -gn "$smoke_user")
           sandbox=$(sudo -n mktemp -d /var/tmp/go-candidate-smoke.XXXXXX)
-          sudo -n chown "$smoke_user:$smoke_group" "$sandbox"
-          sudo -n chmod 0700 "$sandbox"
+          if [[ ! "$sandbox" =~ ^/var/tmp/go-candidate-smoke\.[A-Za-z0-9]{6}$ ]]; then
+            echo "::error::mktemp returned an unexpected smoke sandbox path"
+            exit 1
+          fi
+          sudo -n chown root:root "$sandbox"
+          sudo -n chmod 0711 "$sandbox"
           for name in home tmp config cache data state db work; do
             sudo -n install -d -o "$smoke_user" -g "$smoke_group" -m 0700 "$sandbox/$name"
           done
@@ -1043,6 +1074,7 @@ jobs:
             echo "sandbox=$sandbox"
             echo "binary=$sandbox/candidate"
           } >> "$GITHUB_OUTPUT"
+          trap - EXIT
 
       - name: Execute candidate in empty environment
         env:
@@ -1050,7 +1082,28 @@ jobs:
           SMOKE_BINARY: ${{ steps.extract.outputs.binary }}
           CANDIDATE_VERSION: ${{ needs.metadata.outputs.candidate-version }}
         run: |
-          version_output=$(sudo -n -u nobody -- /usr/bin/env -i \
+          if [[ ! "$SANDBOX" =~ ^/var/tmp/go-candidate-smoke\.[A-Za-z0-9]{6}$ ]] \
+            || [[ "$SMOKE_BINARY" != "$SANDBOX/candidate" ]]; then
+            echo "::error::smoke sandbox or binary path is invalid"
+            exit 1
+          fi
+          cleanup_sandbox() {
+            status=$?
+            trap - EXIT
+            sudo -n /usr/bin/pkill -KILL -u nobody -f -- "$SANDBOX" 2>/dev/null || true
+            if ! sudo -n rm -rf -- "$SANDBOX"; then
+              exit 1
+            fi
+            exit "$status"
+          }
+          trap cleanup_sandbox EXIT
+          if [[ ! -d "$SANDBOX" || "$(stat -c '%U:%G:%a' "$SANDBOX")" != "root:root:711" ]] \
+            || [[ ! -f "$SMOKE_BINARY" || -L "$SMOKE_BINARY" ]]; then
+            echo "::error::smoke sandbox ownership or binary is invalid"
+            exit 1
+          fi
+          version_output=$(/usr/bin/timeout --signal=TERM --kill-after=2s 10s \
+            /usr/bin/sudo -n -u nobody -- /usr/bin/env -i \
             HOME="$SANDBOX/home" \
             TMPDIR="$SANDBOX/tmp" \
             XDG_CONFIG_HOME="$SANDBOX/config" \
@@ -1060,7 +1113,7 @@ jobs:
             DATABASE_URL="sqlite:///$SANDBOX/db/candidate.db" \
             USER=nobody \
             LOGNAME=nobody \
-            /bin/sh -c 'cd "$1" && exec /usr/bin/timeout 30s "$2" --version' \
+            /bin/sh -c "cd \"\$1\" && exec \"\$2\" --version" \
             candidate-smoke "$SANDBOX/work" "$SMOKE_BINARY" 2>&1)
           if [[ "$version_output" != *"$CANDIDATE_VERSION"* ]] || [[ "${version_output,,}" == *dev* ]]; then
             echo "::error::isolated --version output is not the candidate version"
