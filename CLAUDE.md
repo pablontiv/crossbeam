@@ -19,6 +19,7 @@ Shared CI/CD infrastructure for the pablontiv ecosystem. Contains reusable GitHu
 | go-ci.yml | Go CI (build, test, tidy, lint, vuln) | `go-version`, `coverage-threshold` (default: 0), `lint-version` |
 | rust-ci.yml | Rust CI (check-lint, test, audit) | `rust-toolchain`, `deny-checks`, `test-args` |
 | go-release.yml | Go release (auto-tag + goreleaser) | `quality-gate-jobs`, `binary-name`, `graduation-threshold` |
+| go-candidate.yml | Opt-in Go PR candidate artifacts | source/base SHAs, PR number, binary name |
 | rust-release.yml | Rust release (auto-tag + cargo-zigbuild) | `quality-gate-jobs`, `binary-name`, `platforms`, `graduation-threshold` |
 
 ## Versioning

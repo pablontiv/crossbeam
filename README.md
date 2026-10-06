@@ -10,6 +10,7 @@ Shared CI/CD infrastructure for the [pablontiv](https://github.com/pablontiv) ec
 | Security scanning | `codeql.yml`, `gitleaks.yml`, `scorecard.yml` |
 | Go CI (build, test, lint, vuln) | `go-ci.yml` |
 | Rust CI (check, test, audit) | `rust-ci.yml` |
+| PR pre-release artifacts | `go-candidate.yml` |
 | Auto-tag + release | `go-release.yml`, `rust-release.yml` |
 | Baseline tool configs | `configs/` (golangci, goreleaser, rustfmt, clippy, deny, editorconfig) |
 | Community file templates | `templates/` (CONTRIBUTING, SECURITY, issue templates) |
@@ -108,6 +109,7 @@ Crossbeam does not run code. It **defines the rules** under which all other repo
 | `go-ci.yml` | Build, test, tidy, lint, vuln | rootline, roadmapctl, backscroll |
 | `rust-ci.yml` | Check, test, audit | — |
 | `go-release.yml` | Auto-tag + goreleaser | rootline, roadmapctl, backscroll |
+| `go-candidate.yml` | Opt-in, read-only Go PR candidate artifacts | — |
 | `rust-release.yml` | Auto-tag + multi-platform builds | — |
 
 ### Configuration Files
@@ -154,6 +156,93 @@ jobs:
       id-token: write
       attestations: write
 ```
+
+### Go PR candidate artifacts
+
+`go-candidate.yml` is an opt-in `workflow_call` for building a pre-release from an exact PR commit. The caller owns the event trigger, job-level `if`, and `needs`; Crossbeam does not decide which PRs produce artifacts.
+
+Required inputs are `source-repository`, `source-sha` (40 hexadecimal characters), `base-sha` (40 hexadecimal characters), positive `pr-number`, and non-empty `binary-name`. Optional `go-version-file` and `goreleaser-config` default to `go.mod` and `.goreleaser.yml`.
+
+The consuming repository must use this exact GoReleaser snapshot template:
+
+```yaml
+snapshot:
+  version_template: "{{ incpatch .Version }}-pr.{{ .Env.PR_NUMBER }}.g{{ .ShortCommit }}"
+```
+
+Always build after the caller's required checks. A mandatory candidate on every PR can be wired as follows:
+
+```yaml
+on:
+  pull_request:
+
+jobs:
+  test:
+    uses: pablontiv/crossbeam/.github/workflows/go-ci.yml@v1
+
+  candidate:
+    needs: [test]
+    uses: pablontiv/crossbeam/.github/workflows/go-candidate.yml@v1
+    permissions:
+      contents: read
+    with:
+      source-repository: ${{ github.event.pull_request.head.repo.full_name }}
+      source-sha: ${{ github.event.pull_request.head.sha }}
+      base-sha: ${{ github.event.pull_request.base.sha }}
+      pr-number: ${{ github.event.pull_request.number }}
+      binary-name: my-tool
+```
+
+For a manual candidate, expose typed `workflow_dispatch` inputs and pass them through explicitly:
+
+```yaml
+on:
+  workflow_dispatch:
+    inputs:
+      source-repository: { required: true, type: string }
+      source-sha: { required: true, type: string }
+      base-sha: { required: true, type: string }
+      pr-number: { required: true, type: number }
+
+jobs:
+  candidate:
+    uses: pablontiv/crossbeam/.github/workflows/go-candidate.yml@v1
+    permissions:
+      contents: read
+    with:
+      source-repository: ${{ inputs.source-repository }}
+      source-sha: ${{ inputs.source-sha }}
+      base-sha: ${{ inputs.base-sha }}
+      pr-number: ${{ inputs.pr-number }}
+      binary-name: my-tool
+```
+
+To make creation label-controlled, keep the policy in the caller job:
+
+```yaml
+on:
+  pull_request:
+    types: [labeled, synchronize, reopened]
+
+jobs:
+  test:
+    uses: pablontiv/crossbeam/.github/workflows/go-ci.yml@v1
+
+  candidate:
+    if: contains(github.event.pull_request.labels.*.name, 'candidate')
+    needs: [test]
+    uses: pablontiv/crossbeam/.github/workflows/go-candidate.yml@v1
+    permissions:
+      contents: read
+    with:
+      source-repository: ${{ github.event.pull_request.head.repo.full_name }}
+      source-sha: ${{ github.event.pull_request.head.sha }}
+      base-sha: ${{ github.event.pull_request.base.sha }}
+      pr-number: ${{ github.event.pull_request.number }}
+      binary-name: my-tool
+```
+
+The workflow checks out the exact fork SHA without persisted credentials, discards fork tags, and imports only exact stable `vN.N.N` tags from the caller repository. It has only `contents: read`, receives no secrets, and performs no push, tag, release, write, or OIDC operation. GoReleaser runs a clean snapshot; metadata, checksums, manifest, embedded revision, and binary version are validated before only archives, checksums, and `candidate.json` are uploaded for seven days.
 
 ---
 
@@ -225,6 +314,7 @@ jobs:
 | [go-ci.yml](.github/workflows/go-ci.yml) | Go CI: profile (light/full), coverage threshold, lint gate |
 | [rust-ci.yml](.github/workflows/rust-ci.yml) | Rust CI: profile (light/full), toolchain, deny checks |
 | [go-release.yml](.github/workflows/go-release.yml) | Auto-tag + goreleaser: quality gates, graduation threshold |
+| [go-candidate.yml](.github/workflows/go-candidate.yml) | Opt-in Go PR candidate snapshots and interface |
 | [codeql.yml](.github/workflows/codeql.yml) | CodeQL: language input, nightly schedule |
 | [scorecard.yml](.github/workflows/scorecard.yml) | OpenSSF Scorecard: SARIF upload |
 | [gitleaks.yml](.github/workflows/gitleaks.yml) | Secret scanning |

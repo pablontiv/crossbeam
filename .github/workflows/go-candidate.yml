@@ -1,0 +1,334 @@
+name: Go PR Candidate
+
+on:
+  workflow_call:
+    inputs:
+      source-repository:
+        description: 'Fork repository containing the pull request commit (owner/name)'
+        required: true
+        type: string
+      source-sha:
+        description: 'Exact 40-character pull request commit SHA'
+        required: true
+        type: string
+      base-sha:
+        description: 'Exact 40-character base commit SHA from the caller repository'
+        required: true
+        type: string
+      pr-number:
+        description: 'Positive pull request number'
+        required: true
+        type: number
+      binary-name:
+        description: 'Binary to execute from the linux/amd64 archive'
+        required: true
+        type: string
+      go-version-file:
+        description: 'File used by setup-go to select Go'
+        required: false
+        type: string
+        default: 'go.mod'
+      goreleaser-config:
+        description: 'GoReleaser configuration in the source repository'
+        required: false
+        type: string
+        default: '.goreleaser.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  candidate:
+    name: Build PR candidate
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Validate inputs
+        env:
+          SOURCE_REPOSITORY: ${{ inputs.source-repository }}
+          SOURCE_SHA: ${{ inputs.source-sha }}
+          BASE_SHA: ${{ inputs.base-sha }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+          BINARY_NAME: ${{ inputs.binary-name }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import re
+          import sys
+
+          errors = []
+          repository = os.environ["SOURCE_REPOSITORY"]
+          repository_pattern = r"[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?/[A-Za-z0-9](?:[A-Za-z0-9_.-]*[A-Za-z0-9])?"
+          if not re.fullmatch(repository_pattern, repository) or ".." in repository:
+              errors.append("source-repository must be a non-empty owner/name")
+          for name in ("SOURCE_SHA", "BASE_SHA"):
+              if not re.fullmatch(r"[0-9a-fA-F]{40}", os.environ[name]):
+                  errors.append(f"{name.lower().replace('_', '-')} must be exactly 40 hexadecimal characters")
+          if not re.fullmatch(r"[1-9][0-9]*", os.environ["PR_NUMBER"]):
+              errors.append("pr-number must be a positive integer")
+          if not os.environ["BINARY_NAME"].strip():
+              errors.append("binary-name must not be empty")
+          if errors:
+              print("\n".join(f"::error::{error}" for error in errors))
+              sys.exit(1)
+          PY
+
+      - name: Checkout exact PR source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v4.2.2
+        with:
+          repository: ${{ inputs.source-repository }}
+          ref: ${{ inputs.source-sha }}
+          fetch-depth: 1
+          fetch-tags: false
+          persist-credentials: false
+
+      - name: Trust only stable caller tags
+        id: source
+        env:
+          SOURCE_SHA: ${{ inputs.source-sha }}
+          BASE_SHA: ${{ inputs.base-sha }}
+          BASE_REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+        run: |
+          actual_head=$(git rev-parse HEAD)
+          if [[ "${actual_head,,}" != "${SOURCE_SHA,,}" ]]; then
+            echo "::error::Checked out HEAD $actual_head does not equal source SHA $SOURCE_SHA"
+            exit 1
+          fi
+          git config core.abbrev 7
+
+          mapfile -t fork_tags < <(git tag -l)
+          if (( ${#fork_tags[@]} > 0 )); then
+            git tag -d -- "${fork_tags[@]}"
+          fi
+          if [[ -n "$(git tag -l)" ]]; then
+            echo "::error::Failed to remove source repository tags"
+            exit 1
+          fi
+
+          git remote add candidate-base "https://github.com/${BASE_REPOSITORY}.git"
+          git fetch --no-tags candidate-base "$BASE_SHA"
+          fetched_base=$(git rev-parse FETCH_HEAD)
+          if [[ "${fetched_base,,}" != "${BASE_SHA,,}" ]]; then
+            echo "::error::Fetched base $fetched_base does not equal requested base SHA $BASE_SHA"
+            exit 1
+          fi
+
+          while read -r object ref; do
+            [[ -n "$object" ]] || continue
+            tag=${ref#refs/tags/}
+            if [[ "$tag" =~ ^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$ ]]; then
+              git fetch --no-tags candidate-base "$ref:$ref"
+            fi
+          done < <(git ls-remote --tags --refs candidate-base 'refs/tags/v*')
+
+          invalid_tags=$(git tag -l | grep -Ev '^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$' || true)
+          if [[ -n "$invalid_tags" ]]; then
+            echo "::error::A non-stable tag entered the checkout"
+            exit 1
+          fi
+
+          base_version=$(git tag --merged "$SOURCE_SHA" -l 'v*' | sort -V | tail -n 1)
+          if [[ -z "$base_version" ]]; then
+            echo "::error::No stable caller tag is reachable from source SHA"
+            exit 1
+          fi
+          candidate_version=$(python3 - "$base_version" "$PR_NUMBER" "${SOURCE_SHA:0:7}" <<'PY'
+          import re
+          import sys
+
+          match = re.fullmatch(r"v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", sys.argv[1])
+          if not match:
+              raise SystemExit("invalid stable base version")
+          major, minor, patch = map(int, match.groups())
+          print(f"{major}.{minor}.{patch + 1}-pr.{sys.argv[2]}.g{sys.argv[3].lower()}")
+          PY
+          )
+          echo "base_version=$base_version" >> "$GITHUB_OUTPUT"
+          echo "candidate_version=$candidate_version" >> "$GITHUB_OUTPUT"
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v5.6.0
+        with:
+          go-version-file: ${{ inputs.go-version-file }}
+          cache: false
+
+      - name: Build clean GoReleaser snapshot
+        uses: goreleaser/goreleaser-action@f06c13b6b1a9625abc9e6e439d9c05a8f2190e94  # v6.3.0
+        with:
+          distribution: goreleaser
+          version: 'v2.18.2'
+          args: release --snapshot --clean --config ${{ inputs.goreleaser-config }}
+        env:
+          PR_NUMBER: ${{ inputs.pr-number }}
+
+      - name: Validate candidate and stage upload
+        id: candidate
+        env:
+          SOURCE_SHA: ${{ inputs.source-sha }}
+          BASE_SHA: ${{ inputs.base-sha }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+          BASE_VERSION: ${{ steps.source.outputs.base_version }}
+          CANDIDATE_VERSION: ${{ steps.source.outputs.candidate_version }}
+          BINARY_NAME: ${{ inputs.binary-name }}
+        run: |
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import os
+          from pathlib import Path
+          import re
+          import shutil
+          import stat
+          import sys
+          import tarfile
+          import tempfile
+          import zipfile
+
+          dist = Path("dist")
+          artifacts_path = dist / "artifacts.json"
+          metadata_path = dist / "metadata.json"
+          if not artifacts_path.is_file():
+              raise SystemExit("::error::dist/artifacts.json is missing")
+          if not metadata_path.is_file():
+              raise SystemExit("::error::dist/metadata.json is missing")
+
+          artifacts_document = json.loads(artifacts_path.read_text())
+          artifacts = artifacts_document.get("artifacts") if isinstance(artifacts_document, dict) else artifacts_document
+          if not isinstance(artifacts, list):
+              raise SystemExit("::error::artifacts.json must contain an artifacts array")
+          archives = [item for item in artifacts if item.get("type") == "Archive"]
+          if not archives:
+              raise SystemExit("::error::artifacts.json contains no Archive")
+
+          metadata = json.loads(metadata_path.read_text())
+          expected_version = os.environ["CANDIDATE_VERSION"]
+          expected_sha = os.environ["SOURCE_SHA"].lower()
+          if metadata.get("version") != expected_version:
+              raise SystemExit(f"::error::metadata version {metadata.get('version')!r} is not {expected_version!r}")
+          if "dev" in metadata.get("version", "").lower():
+              raise SystemExit("::error::metadata version contains dev")
+          if str(metadata.get("commit", "")).lower() != expected_sha:
+              raise SystemExit("::error::metadata commit does not equal source SHA")
+          expected_pattern = re.compile(r"^(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)-pr\.[1-9][0-9]*\.g[0-9a-f]{7}$")
+          if not expected_pattern.fullmatch(metadata["version"]):
+              raise SystemExit("::error::metadata version does not match the candidate pattern")
+
+          checksum_artifacts = [item for item in artifacts if item.get("type") == "Checksum"]
+          if len(checksum_artifacts) != 1:
+              raise SystemExit("::error::artifacts.json must contain exactly one Checksum")
+          checksum_path = Path(checksum_artifacts[0].get("path", ""))
+          if not checksum_path.is_file():
+              raise SystemExit("::error::checksum artifact is missing")
+          checksums = {}
+          for line in checksum_path.read_text().splitlines():
+              match = re.fullmatch(r"([0-9a-fA-F]{64})  (.+)", line)
+              if not match or Path(match.group(2)).name != match.group(2):
+                  raise SystemExit("::error::invalid checksum line")
+              checksums[match.group(2)] = match.group(1).lower()
+
+          archive_manifest = []
+          seen_names = set()
+          linux_amd64 = []
+          for item in archives:
+              path = Path(item.get("path", ""))
+              if not path.is_file():
+                  raise SystemExit(f"::error::archive is missing: {path}")
+              if path.name in seen_names:
+                  raise SystemExit(f"::error::duplicate archive basename: {path.name}")
+              seen_names.add(path.name)
+              digest = hashlib.sha256(path.read_bytes()).hexdigest()
+              if checksums.get(path.name) != digest:
+                  raise SystemExit(f"::error::checksum missing or incorrect for {path.name}")
+              entry = {
+                  "name": item.get("name", path.name),
+                  "file": path.name,
+                  "goos": item.get("goos"),
+                  "goarch": item.get("goarch"),
+                  "sha256": digest,
+              }
+              archive_manifest.append(entry)
+              if item.get("goos") == "linux" and item.get("goarch") == "amd64":
+                  linux_amd64.append(path)
+          if len(linux_amd64) != 1:
+              raise SystemExit("::error::expected exactly one linux/amd64 Archive")
+
+          binary_name = os.environ["BINARY_NAME"]
+          archive = linux_amd64[0]
+          payloads = []
+          if zipfile.is_zipfile(archive):
+              with zipfile.ZipFile(archive) as bundle:
+                  for info in bundle.infolist():
+                      mode = info.external_attr >> 16
+                      if Path(info.filename).name == binary_name and not info.is_dir() and not stat.S_ISLNK(mode):
+                          payloads.append(bundle.read(info))
+          elif tarfile.is_tarfile(archive):
+              with tarfile.open(archive, "r:*") as bundle:
+                  for member in bundle.getmembers():
+                      if Path(member.name).name == binary_name and member.isfile():
+                          extracted = bundle.extractfile(member)
+                          if extracted is not None:
+                              payloads.append(extracted.read())
+          else:
+              raise SystemExit("::error::linux/amd64 Archive is not a supported tar or zip file")
+          if len(payloads) != 1:
+              raise SystemExit("::error::linux/amd64 Archive must contain binary-name exactly once")
+
+          smoke_dir = Path(tempfile.mkdtemp(prefix="go-candidate-smoke-"))
+          smoke_binary = smoke_dir / "candidate-binary"
+          smoke_binary.write_bytes(payloads[0])
+          smoke_binary.chmod(0o700)
+
+          stage = Path("candidate-upload")
+          if stage.exists():
+              shutil.rmtree(stage)
+          stage.mkdir()
+          for item in archives:
+              shutil.copy2(item["path"], stage / Path(item["path"]).name)
+          shutil.copy2(checksum_path, stage / checksum_path.name)
+          manifest = {
+              "schema": 1,
+              "pr": int(os.environ["PR_NUMBER"]),
+              "sha": expected_sha,
+              "base": os.environ["BASE_SHA"].lower(),
+              "base_version": os.environ["BASE_VERSION"],
+              "candidate_version": expected_version,
+              "archives": archive_manifest,
+          }
+          (stage / "candidate.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
+              print(f"smoke_binary={smoke_binary}", file=output)
+          PY
+
+      - name: Smoke test linux amd64 candidate
+        env:
+          SMOKE_BINARY: ${{ steps.candidate.outputs.smoke_binary }}
+          SOURCE_SHA: ${{ inputs.source-sha }}
+          CANDIDATE_VERSION: ${{ steps.source.outputs.candidate_version }}
+        run: |
+          if [[ ! -x "$SMOKE_BINARY" ]]; then
+            echo "::error::Extracted candidate is not executable"
+            exit 1
+          fi
+          build_info=$(go version -m "$SMOKE_BINARY")
+          revision=$(printf '%s\n' "$build_info" | sed -nE 's/^[[:space:]]*build[[:space:]]+vcs\.revision=(.*)$/\1/p')
+          if [[ "${revision,,}" != "${SOURCE_SHA,,}" ]]; then
+            echo "::error::Binary vcs.revision '$revision' does not equal source SHA '$SOURCE_SHA'"
+            exit 1
+          fi
+          version_output=$("$SMOKE_BINARY" --version 2>&1)
+          if [[ "$version_output" != *"$CANDIDATE_VERSION"* ]]; then
+            echo "::error::Binary --version does not contain candidate version"
+            exit 1
+          fi
+          if [[ "${version_output,,}" == *dev* ]]; then
+            echo "::error::Binary --version contains dev"
+            exit 1
+          fi
+
+      - name: Upload candidate artifacts
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.2
+        with:
+          name: go-candidate-pr-${{ inputs.pr-number }}-${{ inputs.source-sha }}
+          path: candidate-upload/
+          retention-days: 7
+          if-no-files-found: error
