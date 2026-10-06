@@ -205,12 +205,62 @@ jobs:
 
       - name: Smoke test binary
         if: inputs.binary-name != ''
+        env:
+          BINARY_NAME: ${{ inputs.binary-name }}
         run: |
-          ARTIFACT=$(find dist/ -name "${{ inputs.binary-name }}" -type f | head -1)
-          if [[ -n "$ARTIFACT" ]]; then
-            chmod +x "$ARTIFACT"
-            "$ARTIFACT" --version || "$ARTIFACT" version || echo "Smoke test: binary executes"
+          set -euo pipefail
+
+          ARTIFACT=$(python3 <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          manifest = Path("dist/artifacts.json")
+          try:
+              artifacts = json.loads(manifest.read_text())
+          except (OSError, json.JSONDecodeError) as error:
+              raise SystemExit(f"invalid artifact manifest: {error}") from error
+
+          if not isinstance(artifacts, list) or not all(isinstance(item, dict) for item in artifacts):
+              raise SystemExit("invalid artifact manifest: expected a list of objects")
+
+          binary_name = os.environ["BINARY_NAME"]
+          matches = [
+              item
+              for item in artifacts
+              if item.get("type") == "Binary"
+              and item.get("name") == binary_name
+              and item.get("goos") == "linux"
+              and item.get("goarch") == "amd64"
+          ]
+          if len(matches) != 1:
+              raise SystemExit(f"expected exactly one linux/amd64 Binary artifact, found {len(matches)}")
+
+          artifact_path = matches[0].get("path")
+          if not isinstance(artifact_path, str) or not artifact_path:
+              raise SystemExit("matched artifact has no path")
+
+          dist = Path("dist").resolve()
+          candidate = Path(artifact_path)
+          if not candidate.is_absolute():
+              candidate = Path.cwd() / candidate
+          try:
+              candidate = candidate.resolve(strict=True)
+              candidate.relative_to(dist)
+          except (OSError, ValueError) as error:
+              raise SystemExit(f"artifact path is missing or outside dist: {artifact_path}") from error
+          if not candidate.is_file():
+              raise SystemExit(f"artifact path is not a file: {artifact_path}")
+
+          print(candidate)
+          PY
+          )
+
+          chmod +x "$ARTIFACT"
+          if "$ARTIFACT" --version; then
+            exit 0
           fi
+          "$ARTIFACT" version
 
       - name: Generate SLSA attestation
         continue-on-error: true
