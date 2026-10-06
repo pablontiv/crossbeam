@@ -36,6 +36,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   candidate:
@@ -49,6 +50,8 @@ jobs:
           BASE_SHA: ${{ inputs.base-sha }}
           PR_NUMBER: ${{ inputs.pr-number }}
           BINARY_NAME: ${{ inputs.binary-name }}
+          GO_VERSION_FILE: ${{ inputs.go-version-file }}
+          GORELEASER_CONFIG: ${{ inputs.goreleaser-config }}
         run: |
           python3 - <<'PY'
           import os
@@ -67,19 +70,74 @@ jobs:
               errors.append("pr-number must be a positive integer")
           if not os.environ["BINARY_NAME"].strip():
               errors.append("binary-name must not be empty")
+          safe_path_pattern = re.compile(r"[A-Za-z0-9._/-]+")
+          for name in ("GO_VERSION_FILE", "GORELEASER_CONFIG"):
+              value = os.environ[name]
+              if (not value or not safe_path_pattern.fullmatch(value) or value.startswith(("/", "-"))
+                      or any(part in ("", ".", "..") for part in value.split("/"))):
+                  errors.append(f"{name.lower().replace('_', '-')} must be a safe relative path")
           if errors:
               print("\n".join(f"::error::{error}" for error in errors))
               sys.exit(1)
           PY
 
-      - name: Checkout exact PR source
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v4.2.2
-        with:
-          repository: ${{ inputs.source-repository }}
-          ref: ${{ inputs.source-sha }}
-          fetch-depth: 1
-          fetch-tags: false
-          persist-credentials: false
+      - name: Validate PR provenance
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GITHUB_API_URL: ${{ github.api_url }}
+          CALLER_REPOSITORY: ${{ github.repository }}
+          SOURCE_REPOSITORY: ${{ inputs.source-repository }}
+          SOURCE_SHA: ${{ inputs.source-sha }}
+          BASE_SHA: ${{ inputs.base-sha }}
+          PR_NUMBER: ${{ inputs.pr-number }}
+        run: |
+          if [[ -z "$GH_TOKEN" ]]; then
+            echo "::error::GitHub token is unavailable for PR provenance validation"
+            exit 1
+          fi
+          payload=$(curl --fail-with-body --silent --show-error \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header "Accept: application/vnd.github+json" \
+            --header "X-GitHub-Api-Version: 2022-11-28" \
+            "${GITHUB_API_URL%/}/repos/${CALLER_REPOSITORY}/pulls/${PR_NUMBER}")
+          PR_PAYLOAD="$payload" python3 - <<'PY'
+          import json
+          import os
+
+          try:
+              pull = json.loads(os.environ["PR_PAYLOAD"])
+              actual = (
+                  pull["head"]["repo"]["full_name"],
+                  pull["head"]["sha"],
+                  pull["base"]["sha"],
+              )
+          except (KeyError, TypeError, json.JSONDecodeError) as error:
+              raise SystemExit(f"::error::Invalid pull request API payload: {error}")
+          expected = (
+              os.environ["SOURCE_REPOSITORY"],
+              os.environ["SOURCE_SHA"],
+              os.environ["BASE_SHA"],
+          )
+          if actual != expected:
+              raise SystemExit(
+                  "::error::Pull request provenance mismatch: "
+                  f"expected head repo/SHA and base SHA {expected!r}, got {actual!r}"
+              )
+          PY
+
+      - name: Checkout exact PR source without credentials
+        env:
+          SOURCE_REPOSITORY: ${{ inputs.source-repository }}
+          SOURCE_SHA: ${{ inputs.source-sha }}
+        run: |
+          git init .
+          git remote add origin "https://github.com/${SOURCE_REPOSITORY}.git"
+          git fetch --no-tags --depth=1 origin "$SOURCE_SHA"
+          git checkout --detach "$SOURCE_SHA"
+          if [[ "$(git rev-parse HEAD)" != "$SOURCE_SHA" ]]; then
+            echo "::error::Checked out HEAD does not equal source SHA"
+            exit 1
+          fi
 
       - name: Trust only stable caller tags
         id: source
@@ -103,6 +161,18 @@ jobs:
           if [[ -n "$(git tag -l)" ]]; then
             echo "::error::Failed to remove source repository tags"
             exit 1
+          fi
+
+          if [[ "$(git rev-parse --is-shallow-repository)" == "true" ]]; then
+            git fetch --no-tags --unshallow origin "$SOURCE_SHA"
+          fi
+          if [[ "$(git rev-parse --is-shallow-repository)" != "false" ]]; then
+            echo "::error::Source history remains shallow"
+            exit 1
+          fi
+          mapfile -t deepened_tags < <(git tag -l)
+          if (( ${#deepened_tags[@]} > 0 )); then
+            git tag -d -- "${deepened_tags[@]}"
           fi
 
           git remote add candidate-base "https://github.com/${BASE_REPOSITORY}.git"
@@ -146,10 +216,54 @@ jobs:
           echo "base_version=$base_version" >> "$GITHUB_OUTPUT"
           echo "candidate_version=$candidate_version" >> "$GITHUB_OUTPUT"
 
+      - name: Validate source paths
+        id: paths
+        env:
+          GO_VERSION_FILE: ${{ inputs.go-version-file }}
+          GORELEASER_CONFIG: ${{ inputs.goreleaser-config }}
+        run: |
+          python3 - <<'PY'
+          import os
+          from pathlib import Path
+          import re
+          import stat
+
+          workspace = Path.cwd().resolve()
+
+          def safe_regular_file(raw):
+              path = Path(raw)
+              candidate = workspace / path
+              components = [workspace / Path(*path.parts[:index]) for index in range(1, len(path.parts) + 1)]
+              if any(component.is_symlink() for component in components):
+                  raise SystemExit(f"::error::Path must not contain symlinks: {raw}")
+              resolved = candidate.resolve(strict=True)
+              if resolved.parent != workspace and workspace not in resolved.parents:
+                  raise SystemExit(f"::error::Path escapes the workspace: {raw}")
+              if not stat.S_ISREG(resolved.stat(follow_symlinks=False).st_mode):
+                  raise SystemExit(f"::error::Path is not a regular file: {raw}")
+              return resolved
+
+          go_path = safe_regular_file(os.environ["GO_VERSION_FILE"])
+          config_path = safe_regular_file(os.environ["GORELEASER_CONFIG"])
+          go_text = go_path.read_text()
+          direct = re.fullmatch(r"v?([0-9]+\.[0-9]+\.[0-9]+)\s*", go_text)
+          directives = re.findall(r"(?m)^go\s+([0-9]+\.[0-9]+\.[0-9]+)\s*$", go_text)
+          if direct:
+              go_version = direct.group(1)
+          elif len(directives) == 1:
+              go_version = directives[0]
+          else:
+              raise SystemExit("::error::go-version-file must specify exactly one Go patch version")
+          output_path = Path(os.environ["GITHUB_OUTPUT"])
+          with output_path.open("a") as output:
+              print(f"go_version={go_version}", file=output)
+              print(f"goreleaser_config={config_path.relative_to(workspace).as_posix()}", file=output)
+          PY
+
       - name: Setup Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v5.6.0
         with:
-          go-version-file: ${{ inputs.go-version-file }}
+          go-version: ${{ steps.paths.outputs.go_version }}
           cache: false
 
       - name: Build clean GoReleaser snapshot
@@ -157,7 +271,7 @@ jobs:
         with:
           distribution: goreleaser
           version: 'v2.18.2'
-          args: release --snapshot --clean --config ${{ inputs.goreleaser-config }}
+          args: release --snapshot --clean --config=${{ steps.paths.outputs.goreleaser_config }}
         env:
           PR_NUMBER: ${{ inputs.pr-number }}
 
@@ -184,18 +298,41 @@ jobs:
           import tempfile
           import zipfile
 
-          dist = Path("dist")
-          artifacts_path = dist / "artifacts.json"
-          metadata_path = dist / "metadata.json"
-          if not artifacts_path.is_file():
-              raise SystemExit("::error::dist/artifacts.json is missing")
-          if not metadata_path.is_file():
-              raise SystemExit("::error::dist/metadata.json is missing")
+          workspace = Path.cwd().resolve()
+          dist_lexical = workspace / "dist"
+          if dist_lexical.is_symlink() or not dist_lexical.is_dir():
+              raise SystemExit("::error::dist must be a real directory")
+          dist = dist_lexical.resolve(strict=True)
 
+          def safe_dist_file(raw):
+              if not isinstance(raw, str) or not raw or Path(raw).is_absolute():
+                  raise SystemExit(f"::error::Artifact path must be relative: {raw!r}")
+              if any(part in ("", ".", "..") for part in raw.split("/")):
+                  raise SystemExit(f"::error::Artifact path contains traversal: {raw!r}")
+              lexical = workspace / raw
+              try:
+                  lexical.relative_to(dist_lexical)
+              except ValueError:
+                  raise SystemExit(f"::error::Artifact path is outside dist: {raw!r}")
+              relative = lexical.relative_to(workspace)
+              components = [workspace / Path(*relative.parts[:index]) for index in range(1, len(relative.parts) + 1)]
+              if any(component.is_symlink() for component in components):
+                  raise SystemExit(f"::error::Artifact path contains a symlink: {raw!r}")
+              try:
+                  resolved = lexical.resolve(strict=True)
+                  resolved.relative_to(dist)
+              except (FileNotFoundError, ValueError):
+                  raise SystemExit(f"::error::Artifact path is missing or escapes dist: {raw!r}")
+              if not stat.S_ISREG(resolved.stat(follow_symlinks=False).st_mode):
+                  raise SystemExit(f"::error::Artifact path is not a regular file: {raw!r}")
+              return resolved
+
+          artifacts_path = safe_dist_file("dist/artifacts.json")
+          metadata_path = safe_dist_file("dist/metadata.json")
           artifacts_document = json.loads(artifacts_path.read_text())
           artifacts = artifacts_document.get("artifacts") if isinstance(artifacts_document, dict) else artifacts_document
-          if not isinstance(artifacts, list):
-              raise SystemExit("::error::artifacts.json must contain an artifacts array")
+          if not isinstance(artifacts, list) or not all(isinstance(item, dict) for item in artifacts):
+              raise SystemExit("::error::artifacts.json must contain an artifacts array of objects")
           archives = [item for item in artifacts if item.get("type") == "Archive"]
           if not archives:
               raise SystemExit("::error::artifacts.json contains no Archive")
@@ -216,23 +353,23 @@ jobs:
           checksum_artifacts = [item for item in artifacts if item.get("type") == "Checksum"]
           if len(checksum_artifacts) != 1:
               raise SystemExit("::error::artifacts.json must contain exactly one Checksum")
-          checksum_path = Path(checksum_artifacts[0].get("path", ""))
-          if not checksum_path.is_file():
-              raise SystemExit("::error::checksum artifact is missing")
+          checksum_path = safe_dist_file(checksum_artifacts[0].get("path"))
           checksums = {}
           for line in checksum_path.read_text().splitlines():
-              match = re.fullmatch(r"([0-9a-fA-F]{64})  (.+)", line)
-              if not match or Path(match.group(2)).name != match.group(2):
+              match = re.fullmatch(r"([0-9a-fA-F]{64})  ([^/]+)", line)
+              if not match:
                   raise SystemExit("::error::invalid checksum line")
-              checksums[match.group(2)] = match.group(1).lower()
+              name = match.group(2)
+              if name in checksums:
+                  raise SystemExit(f"::error::duplicate checksum entry: {name}")
+              checksums[name] = match.group(1).lower()
 
           archive_manifest = []
+          archive_files = []
           seen_names = set()
           linux_amd64 = []
           for item in archives:
-              path = Path(item.get("path", ""))
-              if not path.is_file():
-                  raise SystemExit(f"::error::archive is missing: {path}")
+              path = safe_dist_file(item.get("path"))
               if path.name in seen_names:
                   raise SystemExit(f"::error::duplicate archive basename: {path.name}")
               seen_names.add(path.name)
@@ -247,8 +384,15 @@ jobs:
                   "sha256": digest,
               }
               archive_manifest.append(entry)
+              archive_files.append(path)
               if item.get("goos") == "linux" and item.get("goarch") == "amd64":
                   linux_amd64.append(path)
+          if set(checksums) != seen_names:
+              raise SystemExit("::error::checksums must correspond exactly one-to-one with declared archives")
+          if checksum_path.name in seen_names or checksum_path.name == "candidate.json":
+              raise SystemExit("::error::staged artifact basenames must be unique")
+          archive_manifest.sort(key=lambda entry: entry["file"])
+          archive_files.sort(key=lambda path: path.name)
           if len(linux_amd64) != 1:
               raise SystemExit("::error::expected exactly one linux/amd64 Archive")
 
@@ -282,8 +426,8 @@ jobs:
           if stage.exists():
               shutil.rmtree(stage)
           stage.mkdir()
-          for item in archives:
-              shutil.copy2(item["path"], stage / Path(item["path"]).name)
+          for path in archive_files:
+              shutil.copy2(path, stage / path.name)
           shutil.copy2(checksum_path, stage / checksum_path.name)
           manifest = {
               "schema": 1,
@@ -294,7 +438,12 @@ jobs:
               "candidate_version": expected_version,
               "archives": archive_manifest,
           }
-          (stage / "candidate.json").write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+          manifest_path = stage / "candidate.json"
+          manifest_path.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+          expected_staged = seen_names | {checksum_path.name, manifest_path.name}
+          actual_staged = {path.name for path in stage.iterdir() if path.is_file() and not path.is_symlink()}
+          if actual_staged != expected_staged or len(list(stage.iterdir())) != len(expected_staged):
+              raise SystemExit("::error::staged files do not exactly match archives, checksums, and manifest")
           with Path(os.environ["GITHUB_OUTPUT"]).open("a") as output:
               print(f"smoke_binary={smoke_binary}", file=output)
           PY

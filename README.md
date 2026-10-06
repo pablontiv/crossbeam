@@ -161,7 +161,9 @@ jobs:
 
 `go-candidate.yml` is an opt-in `workflow_call` for building a pre-release from an exact PR commit. The caller owns the event trigger, job-level `if`, and `needs`; Crossbeam does not decide which PRs produce artifacts.
 
-Required inputs are `source-repository`, `source-sha` (40 hexadecimal characters), `base-sha` (40 hexadecimal characters), positive `pr-number`, and non-empty `binary-name`. Optional `go-version-file` and `goreleaser-config` default to `go.mod` and `.goreleaser.yml`.
+Required inputs are `source-repository`, `source-sha` (40 hexadecimal characters), `base-sha` (40 hexadecimal characters), positive `pr-number`, and non-empty `binary-name`. Optional `go-version-file` and `goreleaser-config` default to `go.mod` and `.goreleaser.yml`; both must be safe relative regular-file paths. The Go version file must select an exact patch release such as `1.24.1` (including an exact `go 1.24.1` directive).
+
+The caller grants only `contents: read` and `pull-requests: read`. The workflow uses the token solely to read the numbered PR from the caller repository and requires exact API agreement for the head repository, head SHA, and base SHA. If the PR base changes, regenerate the candidate with the new `base-sha`; stale inputs fail closed.
 
 The consuming repository must use this exact GoReleaser snapshot template:
 
@@ -185,6 +187,7 @@ jobs:
     uses: pablontiv/crossbeam/.github/workflows/go-candidate.yml@v1
     permissions:
       contents: read
+      pull-requests: read
     with:
       source-repository: ${{ github.event.pull_request.head.repo.full_name }}
       source-sha: ${{ github.event.pull_request.head.sha }}
@@ -209,6 +212,7 @@ jobs:
     uses: pablontiv/crossbeam/.github/workflows/go-candidate.yml@v1
     permissions:
       contents: read
+      pull-requests: read
     with:
       source-repository: ${{ inputs.source-repository }}
       source-sha: ${{ inputs.source-sha }}
@@ -234,6 +238,7 @@ jobs:
     uses: pablontiv/crossbeam/.github/workflows/go-candidate.yml@v1
     permissions:
       contents: read
+      pull-requests: read
     with:
       source-repository: ${{ github.event.pull_request.head.repo.full_name }}
       source-sha: ${{ github.event.pull_request.head.sha }}
@@ -242,7 +247,9 @@ jobs:
       binary-name: my-tool
 ```
 
-The workflow checks out the exact fork SHA without persisted credentials, discards fork tags, and imports only exact stable `vN.N.N` tags from the caller repository. It has only `contents: read`, receives no secrets, and performs no push, tag, release, write, or OIDC operation. GoReleaser runs a clean snapshot; metadata, checksums, manifest, embedded revision, and binary version are validated before only archives, checksums, and `candidate.json` are uploaded for seven days.
+The workflow checks out and deepens the exact public fork SHA without credentials, discards fork tags, and imports only exact stable `vN.N.N` tags from the caller repository. Its token is confined to PR API validation under `contents: read` and `pull-requests: read`; checkout, build, and GoReleaser receive no token or secrets. It performs no push, tag, release, write, or OIDC operation. GoReleaser runs a clean snapshot; confined artifact paths, metadata, one-to-one checksums, manifest, embedded revision, and binary version are validated before only archives, checksums, and `candidate.json` are uploaded for seven days.
+
+This workflow intentionally executes code supplied by the fork. The runner is ephemeral and has no persisted checkout credentials or build secrets, which limits repository compromise, but untrusted build code can still use runner CPU/network and observe public workflow context. Callers should keep the job secret-free, apply their own approval or label policy, and never add privileged credentials to it.
 
 ---
 
