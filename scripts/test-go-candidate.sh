@@ -56,6 +56,7 @@ PY
 }
 
 extract_step "Validate PR and base graph" "$TEST_ROOT/metadata.sh"
+extract_step "Bound and stage raw dist" "$TEST_ROOT/stage-raw.sh"
 extract_step "Validate raw candidate statically" "$TEST_ROOT/static.sh"
 extract_step "Extract only validated smoke binary" "$TEST_ROOT/extract.sh"
 extract_step "Execute candidate in empty environment" "$TEST_ROOT/smoke.sh"
@@ -181,19 +182,37 @@ done
 (
   cd "$fixture_repo"
   GOTOOLCHAIN=local go build -ldflags "-X main.version=$candidate_version" -o "$TEST_ROOT/tool-host"
+  printf '\n// dirty build fixture\n' >> main.go
+  CGO_ENABLED=0 GOOS=linux GOARCH=amd64 GOTOOLCHAIN=local \
+    go build -ldflags "-X main.version=$candidate_version" -o "$binary_dir/linux_amd64_dirty"
+  git checkout -- main.go
 )
 go_version=$(go env GOVERSION)
 go_version=${go_version#go}
+real_go=$(command -v go)
+mkdir -p "$TEST_ROOT/go-inspector-bin"
+cat > "$TEST_ROOT/go-inspector-bin/go" <<'GOINSPECT'
+#!/usr/bin/env bash
+output=$("$REAL_GO" "$@")
+case "${MOCK_BUILDINFO_MISMATCH:-}" in
+  goos) output=${output/GOOS=linux/GOOS=xxxxx} ;;
+  goarch) output=${output/GOARCH=amd64/GOARCH=xxxxx} ;;
+esac
+printf '%s\n' "$output"
+GOINSPECT
+chmod +x "$TEST_ROOT/go-inspector-bin/go"
 
 make_raw() {
   local dir=$1 mode=${2:-valid}
   mkdir -p "$dir/raw/dist"
   python3 - "$binary_dir" "$dir/raw/dist" "$mode" <<'PY'
 from pathlib import Path
+import gzip
 import hashlib
 import io
 import json
 import stat
+import struct
 import sys
 import tarfile
 import zipfile
@@ -219,7 +238,26 @@ def binary_for(goos, goarch):
         override = ("windows", "arm64")
     actual_os, actual_arch = override or (goos, goarch)
     actual_suffix = ".exe" if actual_os == "windows" else ""
-    return (binaries / f"{actual_os}_{actual_arch}{actual_suffix}").read_bytes()
+    path = binaries / f"{actual_os}_{actual_arch}{actual_suffix}"
+    if mode == "vcs-modified" and (goos, goarch) == ("linux", "amd64"):
+        path = binaries / "linux_amd64_dirty"
+    data = path.read_bytes()
+    if mode == "buildinfo-goos" and (goos, goarch) == ("linux", "amd64"):
+        changed = data.replace(b"GOOS=linux", b"GOOS=xxxxx", 1)
+        if changed == data: raise SystemExit("GOOS build setting fixture not found")
+        data = changed
+    if mode == "buildinfo-goarch" and (goos, goarch) == ("linux", "amd64"):
+        changed = data.replace(b"GOARCH=amd64", b"GOARCH=xxxxx", 1)
+        if changed == data: raise SystemExit("GOARCH build setting fixture not found")
+        data = changed
+    if mode == "elf-class" and (goos, goarch) == ("linux", "amd64"):
+        data = data[:4] + b"\x01" + data[5:]
+    if mode == "elf-endian" and (goos, goarch) == ("linux", "amd64"):
+        data = data[:5] + b"\x02" + data[6:]
+    if mode == "pe32" and (goos, goarch) == ("windows", "amd64"):
+        offset = struct.unpack_from("<I", data, 0x3C)[0] + 24
+        data = data[:offset] + b"\x0b\x01" + data[offset + 2:]
+    return data
 
 def add_tar(bundle, name, data=b"x", permissions=0o644, kind=tarfile.REGTYPE, link=""):
     info = tarfile.TarInfo(name)
@@ -266,6 +304,8 @@ for goos, goarch in platforms:
             elif is_primary and mode == "device": add_tar(bundle, "tool", kind=tarfile.CHRTYPE, permissions=0o600)
             elif is_primary and mode == "fifo": add_tar(bundle, "tool", kind=tarfile.FIFOTYPE, permissions=0o600)
             elif is_primary and mode == "tar-dir": add_tar(bundle, "docs", kind=tarfile.DIRTYPE, permissions=0o755); add_tar(bundle, "tool", payload, 0o755)
+            elif is_primary and mode == "pax": add_tar(bundle, "pax", b"path=tool\n", 0o644, tarfile.XHDTYPE); add_tar(bundle, "tool", payload, 0o755)
+            elif is_primary and mode == "gnu-longname": add_tar(bundle, "././@LongLink", b"tool\x00", 0o644, tarfile.GNUTYPE_LONGNAME); add_tar(bundle, "tool", payload, 0o755)
             elif is_primary and mode == "hidden": add_tar(bundle, ".hidden", b"x", 0o644); add_tar(bundle, "tool", payload, 0o755)
             elif is_primary and mode == "duplicate": add_tar(bundle, "tool", payload, 0o755); add_tar(bundle, "tool", payload, 0o755)
             elif is_primary and mode == "casefold": add_tar(bundle, "README.md", b"x", 0o644); add_tar(bundle, "readme.md", b"y", 0o644); add_tar(bundle, "tool", payload, 0o755)
@@ -285,6 +325,59 @@ for goos, goarch in platforms:
                 add_tar(bundle, "LICENSE", docs, 0o644)
                 if goarch == "amd64": add_tar(bundle, "README.md", b"safe product documentation", 0o644)
     archives.append({"type": "Archive", "name": archive_name, "path": f"dist/{archive_name}", "goos": goos, "goarch": goarch})
+
+primary_tar = dist / "tool_linux_amd64.tar.gz"
+primary_zip = dist / "tool_windows_amd64.zip"
+
+def ustar_header(name, size, permissions=0o644, kind=b"0"):
+    header = bytearray(512)
+    header[:len(name)] = name.encode("ascii")
+    def octal(offset, length, value):
+        encoded = f"{value:0{length - 1}o}".encode("ascii") + b"\x00"
+        header[offset:offset + length] = encoded
+    octal(100, 8, permissions); octal(108, 8, 0); octal(116, 8, 0)
+    octal(124, 12, size); octal(136, 12, 0)
+    header[148:156] = b" " * 8
+    header[156:157] = kind
+    header[257:263] = b"ustar\x00"
+    header[263:265] = b"00"
+    checksum = sum(header)
+    header[148:156] = f"{checksum:06o}".encode("ascii") + b"\x00 "
+    return bytes(header)
+
+if mode in ("tar-huge-declared", "tar-truncated", "tar-high-ratio"):
+    if mode == "tar-huge-declared": size, payload = 256 * 1024 * 1024 + 1, b""
+    elif mode == "tar-high-ratio": size, payload = 256 * 1024 * 1024, b""
+    else: size, payload = 1024, b"short"
+    with gzip.open(primary_tar, "wb") as stream:
+        stream.write(ustar_header("tool", size, 0o755))
+        stream.write(payload)
+
+if mode in ("zip64", "zip-many", "zip-huge-central"):
+    entries = 0xFFFF if mode == "zip64" else (129 if mode == "zip-many" else 1)
+    central_size = 0 if mode != "zip-huge-central" else 4 * 1024 * 1024 + 1
+    prefix = b"PAYLOAD_MUST_NOT_BE_READ"
+    eocd = struct.pack("<4s4H2LH", b"PK\x05\x06", 0, 0, entries, entries, central_size, 0, 0)
+    primary_zip.write_bytes(prefix + eocd)
+elif mode in ("zip-corrupt-doc", "zip-local-name"):
+    with zipfile.ZipFile(primary_zip) as bundle:
+        info = next(value for value in bundle.infolist() if value.filename == "README.md")
+        offset = info.header_offset
+    with primary_zip.open("r+b") as stream:
+        stream.seek(offset)
+        fixed = stream.read(30)
+        name_size, extra_size = struct.unpack_from("<HH", fixed, 26)
+        if mode == "zip-local-name":
+            stream.seek(offset + 30)
+            raw_name = stream.read(name_size)
+            stream.seek(offset + 30)
+            stream.write(b"X" + raw_name[1:])
+        else:
+            data_offset = offset + 30 + name_size + extra_size
+            stream.seek(data_offset + max(info.compress_size // 2, 0))
+            original = stream.read(1)
+            stream.seek(data_offset + max(info.compress_size // 2, 0))
+            stream.write(bytes([original[0] ^ 0xFF]))
 
 checksum_lines = []
 for item in sorted(archives, key=lambda value: value["path"]):
@@ -308,12 +401,54 @@ root = Path(sys.argv[1]) / "raw/dist"
 PY
 }
 
+echo ""
+echo "=== Post-build provenance and raw allowlist ==="
+stage_fixture="$TEST_ROOT/stage-fixture"
+make_raw "$stage_fixture/generated" config-extra
+mkdir -p "$stage_fixture/source"
+git init -b main "$stage_fixture/source" >/dev/null
+configure_git "$stage_fixture/source"
+printf 'dist/\n' > "$stage_fixture/source/.gitignore"
+printf 'trusted\n' > "$stage_fixture/source/tracked.txt"
+git -C "$stage_fixture/source" add .gitignore tracked.txt
+git -C "$stage_fixture/source" commit -m "chore: stage fixture" >/dev/null
+stage_sha=$(git -C "$stage_fixture/source" rev-parse HEAD)
+cp -R "$stage_fixture/generated/raw/dist" "$stage_fixture/source/dist"
+expect_status "clean exact HEAD stages only raw allowlist" success "$stage_fixture/clean.log" \
+  env SOURCE_SHA="$stage_sha" RAW_ROOT="$stage_fixture/staged" \
+  bash -c "cd '$stage_fixture' && '$TEST_ROOT/stage-raw.sh'"
+staged_count=$(find "$stage_fixture/staged/dist" -maxdepth 1 -type f | wc -l | tr -d ' ')
+record "raw stage has control files checksum and six archives" 9 "$staged_count"
+record "raw stage excludes config.yaml" absent "$([[ -e "$stage_fixture/staged/dist/config.yaml" ]] && echo present || echo absent)"
+printf 'mutated\n' >> "$stage_fixture/source/tracked.txt"
+expect_status "tracked build mutation rejected" failure "$stage_fixture/mutation.log" \
+  env SOURCE_SHA="$stage_sha" RAW_ROOT="$stage_fixture/rejected-mutation" \
+  bash -c "cd '$stage_fixture' && '$TEST_ROOT/stage-raw.sh'"
+git -C "$stage_fixture/source" checkout -- tracked.txt
+printf 'hook output\n' > "$stage_fixture/source/hook-output.txt"
+expect_status "untracked hook output rejected" failure "$stage_fixture/hook.log" \
+  env SOURCE_SHA="$stage_sha" RAW_ROOT="$stage_fixture/rejected-hook" \
+  bash -c "cd '$stage_fixture' && '$TEST_ROOT/stage-raw.sh'"
+rm "$stage_fixture/source/hook-output.txt"
+expect_status "changed HEAD rejected" failure "$stage_fixture/head.log" \
+  env SOURCE_SHA=bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb RAW_ROOT="$stage_fixture/rejected-head" \
+  bash -c "cd '$stage_fixture' && '$TEST_ROOT/stage-raw.sh'"
+
 run_static_case() {
   local name=$1 mode=$2 expected=$3 expected_go=${4:-$go_version}
   local dir="$TEST_ROOT/static-${name// /-}"
+  local inspect_path=$PATH mismatch=
+  if [[ "$mode" == buildinfo-goos ]]; then
+    inspect_path="$TEST_ROOT/go-inspector-bin:$PATH"
+    mismatch=goos
+  elif [[ "$mode" == buildinfo-goarch ]]; then
+    inspect_path="$TEST_ROOT/go-inspector-bin:$PATH"
+    mismatch=goarch
+  fi
   make_raw "$dir" "$mode"
   expect_status "$name" "$expected" "$dir/run.log" \
-    env SOURCE_SHA="$fixture_sha" CANDIDATE_VERSION="$candidate_version" \
+    env PATH="$inspect_path" REAL_GO="$real_go" MOCK_BUILDINFO_MISMATCH="$mismatch" \
+    SOURCE_SHA="$fixture_sha" CANDIDATE_VERSION="$candidate_version" \
     BINARY_NAME=tool GO_VERSION="$expected_go" \
     bash -c "cd '$dir' && '$TEST_ROOT/static.sh'"
 }
@@ -327,8 +462,18 @@ run_static_case "archive hardlink rejected" hardlink failure
 run_static_case "archive device rejected" device failure
 run_static_case "archive FIFO rejected" fifo failure
 run_static_case "archive TAR directory rejected" tar-dir failure
+run_static_case "PAX header rejected" pax failure
+run_static_case "GNU longname header rejected" gnu-longname failure
+run_static_case "huge declared TAR member rejected before payload" tar-huge-declared failure
+run_static_case "truncated TAR payload rejected" tar-truncated failure
+run_static_case "high-ratio TAR rejected before payload" tar-high-ratio failure
 run_static_case "archive ZIP symlink rejected" zip-symlink failure
 run_static_case "archive ZIP directory rejected" zip-dir failure
+run_static_case "ZIP64 sentinel rejected in preflight" zip64 failure
+run_static_case "many-entry ZIP rejected in preflight" zip-many failure
+run_static_case "huge ZIP central directory rejected in preflight" zip-huge-central failure
+run_static_case "corrupt ZIP documentation payload rejected" zip-corrupt-doc failure
+run_static_case "ZIP local and central filename mismatch rejected" zip-local-name failure
 run_static_case "hidden archive member rejected" hidden failure
 run_static_case "duplicate archive member rejected" duplicate failure
 run_static_case "casefold collision rejected" casefold failure
@@ -349,7 +494,22 @@ run_static_case "raw config and intermediates excluded" config-extra failure
 run_static_case "ELF architecture label mismatch rejected" header-linux failure
 run_static_case "Mach-O architecture label mismatch rejected" header-darwin failure
 run_static_case "PE architecture label mismatch rejected" header-windows failure
+run_static_case "ELF32 class rejected" elf-class failure
+run_static_case "big-endian ELF rejected" elf-endian failure
+run_static_case "PE32 instead of PE32+ rejected" pe32 failure
+run_static_case "dirty VCS build rejected" vcs-modified failure
+run_static_case "build-info GOOS mismatch rejected" buildinfo-goos failure
+run_static_case "build-info GOARCH mismatch rejected" buildinfo-goarch failure
 run_static_case "exact compiler version rejects substring" valid failure "${go_version}0"
+for preflight_log in \
+  "$TEST_ROOT/static-ZIP64-sentinel-rejected-in-preflight/run.log" \
+  "$TEST_ROOT/static-many-entry-ZIP-rejected-in-preflight/run.log" \
+  "$TEST_ROOT/static-huge-ZIP-central-directory-rejected-in-preflight/run.log"; do
+  record "ZIP rejection is explicitly preflighted: $(basename "$(dirname "$preflight_log")")" present \
+    "$(grep -q 'ZIP preflight' "$preflight_log" && echo present || echo absent)"
+done
+record "TAR ratio rejected before payload read" present \
+  "$(grep -q 'before payload read' "$TEST_ROOT/static-high-ratio-TAR-rejected-before-payload/run.log" && echo present || echo absent)"
 
 echo ""
 echo "=== Isolated smoke and deterministic publication ==="

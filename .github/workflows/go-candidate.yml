@@ -266,7 +266,18 @@ jobs:
       - name: Bound and stage raw dist
         env:
           RAW_ROOT: ${{ runner.temp }}/candidate-raw
+          SOURCE_SHA: ${{ needs.metadata.outputs.source-sha }}
         run: |
+          if [[ "$(git -C source rev-parse HEAD)" != "$SOURCE_SHA" ]]; then
+            echo "::error::source HEAD changed during GoReleaser"
+            exit 1
+          fi
+          source_status=$(git -C source status --porcelain --untracked-files=all)
+          if [[ -n "$source_status" ]]; then
+            echo "::error::source checkout was modified by build or hooks"
+            printf '%s\n' "$source_status"
+            exit 1
+          fi
           python3 - <<'PY'
           import json
           import os
@@ -375,15 +386,17 @@ jobs:
           GO_VERSION: ${{ inputs.go-version }}
         run: |
           python3 - <<'PY'
+          import gzip
           import hashlib
           import json
           import os
           from pathlib import Path, PurePosixPath
           import re
+          import resource
           import stat
           import struct
           import subprocess
-          import tarfile
+          import sys
           import tempfile
           import zipfile
 
@@ -402,6 +415,15 @@ jobs:
               ("darwin", "amd64"), ("darwin", "arm64"),
               ("windows", "amd64"), ("windows", "arm64"),
           }
+          if sys.platform.startswith("linux"):
+              for limit, soft in (
+                  (resource.RLIMIT_CPU, 180),
+                  (resource.RLIMIT_FSIZE, 1024 * 1024 * 1024),
+                  (resource.RLIMIT_NOFILE, 256),
+              ):
+                  current_soft, current_hard = resource.getrlimit(limit)
+                  bounded = soft if current_hard == resource.RLIM_INFINITY else min(soft, current_hard)
+                  resource.setrlimit(limit, (bounded, current_hard))
 
           def regular(path, maximum=None):
               if path.is_symlink() or not path.is_file() or not stat.S_ISREG(path.stat(follow_symlinks=False).st_mode):
@@ -512,28 +534,179 @@ jobs:
                   raise SystemExit("::error::archive lacks its exact root platform binary")
               return binary_key, binary_size
 
-          def read_bounded(stream, expected_size):
+          def read_member_bounded(stream, expected_size, capture):
               chunks = []
               total = 0
-              while True:
-                  chunk = stream.read(min(1024 * 1024, MAX_MEMBER + 1 - total))
+              while total < expected_size:
+                  chunk = stream.read(min(1024 * 1024, expected_size - total))
                   if not chunk:
-                      break
-                  chunks.append(chunk)
+                      raise SystemExit("::error::archive member payload is truncated")
+                  if capture:
+                      chunks.append(chunk)
                   total += len(chunk)
-                  if total > expected_size or total > MAX_MEMBER:
-                      raise SystemExit("::error::binary payload exceeds bounded metadata")
-              if total != expected_size:
-                  raise SystemExit("::error::binary payload size differs from metadata")
-              return b"".join(chunks)
+              if stream.read(1):
+                  raise SystemExit("::error::archive member exceeds declared size")
+              return b"".join(chunks) if capture else None
+
+          def preflight_zip(path):
+              size = path.stat().st_size
+              tail_size = min(size, 22 + 65535)
+              with path.open("rb") as stream:
+                  stream.seek(size - tail_size)
+                  tail = stream.read(tail_size)
+              marker = tail.rfind(b"PK\x05\x06")
+              if marker < 0 or marker + 22 > len(tail):
+                  raise SystemExit("::error::ZIP preflight cannot find EOCD")
+              eocd_offset = size - tail_size + marker
+              fields = struct.unpack_from("<4s4H2LH", tail, marker)
+              _, disk, cd_disk, disk_entries, entries, cd_size, cd_offset, comment_size = fields
+              if marker + 22 + comment_size != len(tail):
+                  raise SystemExit("::error::ZIP preflight rejects trailing or malformed EOCD data")
+              if disk or cd_disk or disk_entries != entries:
+                  raise SystemExit("::error::ZIP preflight rejects multi-disk archives")
+              if entries == 0xFFFF or cd_size == 0xFFFFFFFF or cd_offset == 0xFFFFFFFF:
+                  raise SystemExit("::error::ZIP preflight rejects ZIP64 sentinels")
+              if not 1 <= entries <= MAX_ENTRIES:
+                  raise SystemExit("::error::ZIP preflight entry count exceeds limit")
+              if cd_size > MAX_CONTROL:
+                  raise SystemExit("::error::ZIP preflight central directory exceeds limit")
+              if cd_offset > eocd_offset or cd_size > eocd_offset - cd_offset or cd_offset + cd_size != eocd_offset:
+                  raise SystemExit("::error::ZIP preflight central directory offset or size is invalid")
+              return entries
+
+          def local_zip_name(path, info):
+              with path.open("rb") as stream:
+                  if info.header_offset < 0 or info.header_offset + 30 > path.stat().st_size:
+                      raise SystemExit("::error::ZIP local header offset is invalid")
+                  stream.seek(info.header_offset)
+                  fixed = stream.read(30)
+                  if len(fixed) != 30 or fixed[:4] != b"PK\x03\x04":
+                      raise SystemExit("::error::ZIP local header signature is invalid")
+                  name_size, extra_size = struct.unpack_from("<HH", fixed, 26)
+                  if name_size > 4096 or extra_size > MAX_CONTROL:
+                      raise SystemExit("::error::ZIP local header fields exceed limits")
+                  raw_name = stream.read(name_size)
+                  if len(raw_name) != name_size:
+                      raise SystemExit("::error::ZIP local header filename is truncated")
+              encoding = "utf-8" if info.flag_bits & 0x800 else "cp437"
+              try:
+                  expected = info.filename.encode(encoding)
+              except UnicodeEncodeError:
+                  raise SystemExit("::error::ZIP central filename encoding is unsafe")
+              if raw_name != expected:
+                  raise SystemExit("::error::ZIP local and central filenames differ")
+
+          def parse_tar_octal(field, label):
+              if field and field[0] & 0x80:
+                  raise SystemExit(f"::error::TAR {label} uses unsupported base-256 encoding")
+              value = field.rstrip(b"\x00 ").lstrip(b" ")
+              if not value or any(byte not in b"01234567" for byte in value):
+                  raise SystemExit(f"::error::TAR {label} is not canonical octal")
+              return int(value, 8)
+
+          def parse_tar_name(field):
+              value, separator, remainder = field.partition(b"\x00")
+              if separator and any(remainder):
+                  raise SystemExit("::error::TAR name field has nonzero padding")
+              try:
+                  return value.decode("ascii")
+              except UnicodeDecodeError:
+                  raise SystemExit("::error::TAR name is not ASCII")
+
+          def scan_tar_gz(path, expected_binary):
+              archive_size = path.stat().st_size
+              streamed = 0
+              expanded = 0
+              count = 0
+              seen = set()
+              binary_data = None
+              binary_aliases = {os.environ["BINARY_NAME"], f"{os.environ['BINARY_NAME']}.exe"}
+
+              def read_exact(stream, size, capture=True):
+                  nonlocal streamed
+                  chunks = []
+                  remaining = size
+                  while remaining:
+                      chunk = stream.read(min(1024 * 1024, remaining))
+                      if not chunk:
+                          raise SystemExit("::error::TAR.GZ payload is truncated")
+                      if capture:
+                          chunks.append(chunk)
+                      streamed += len(chunk)
+                      if streamed > MAX_EXPANDED + MAX_ENTRIES * 1024 + 1024 * 1024:
+                          raise SystemExit("::error::TAR.GZ stream exceeds global limit")
+                      remaining -= len(chunk)
+                  return b"".join(chunks) if capture else None
+
+              with path.open("rb") as compressed:
+                  if compressed.read(2) != b"\x1f\x8b":
+                      raise SystemExit("::error::Unix archive must be GZIP-compressed TAR")
+                  compressed.seek(0)
+                  with gzip.GzipFile(fileobj=compressed) as stream:
+                      while True:
+                          header = read_exact(stream, 512)
+                          if header == b"\x00" * 512:
+                              while True:
+                                  chunk = stream.read(1024 * 1024)
+                                  if not chunk:
+                                      break
+                                  streamed += len(chunk)
+                                  if any(chunk) or streamed > MAX_EXPANDED + MAX_ENTRIES * 1024 + 1024 * 1024:
+                                      raise SystemExit("::error::TAR.GZ has nonzero or excessive trailing data")
+                              break
+                          count += 1
+                          if count > MAX_ENTRIES:
+                              raise SystemExit("::error::TAR entry count exceeds limit before payload read")
+                          if header[257:263] != b"ustar\x00":
+                              raise SystemExit("::error::TAR header is not simple USTAR")
+                          stored_checksum = parse_tar_octal(header[148:156], "checksum")
+                          checksum_header = header[:148] + b" " * 8 + header[156:]
+                          if sum(checksum_header) != stored_checksum:
+                              raise SystemExit("::error::TAR header checksum mismatch")
+                          typeflag = header[156:157]
+                          if typeflag not in (b"\x00", b"0"):
+                              raise SystemExit("::error::TAR rejects PAX, GNU longname, directory, link, device, FIFO, or special member")
+                          name = parse_tar_name(header[:100])
+                          prefix = parse_tar_name(header[345:500])
+                          if prefix:
+                              name = f"{prefix}/{name}"
+                          parts = safe_member_name(name)
+                          folded = name.casefold()
+                          if folded in seen:
+                              raise SystemExit("::error::duplicate or casefold-colliding TAR member")
+                          seen.add(folded)
+                          size = parse_tar_octal(header[124:136], "size")
+                          mode = parse_tar_octal(header[100:108], "mode")
+                          if size > MAX_MEMBER:
+                              raise SystemExit("::error::TAR member size exceeds limit before payload read")
+                          expanded += size
+                          if expanded > MAX_EXPANDED or expanded > max(archive_size, 1) * MAX_RATIO:
+                              raise SystemExit("::error::TAR expanded size or ratio exceeds limit before payload read")
+                          permissions = mode & 0o7777
+                          is_binary = parts[-1] in binary_aliases
+                          if permissions & 0o7022:
+                              raise SystemExit("::error::TAR member has unsafe mode")
+                          if is_binary:
+                              if len(parts) != 1 or name != expected_binary or binary_data is not None or not permissions & 0o111:
+                                  raise SystemExit("::error::TAR binary name, root path, uniqueness, or mode mismatch")
+                          elif permissions & 0o111:
+                              raise SystemExit("::error::TAR documentation member must not be executable")
+                          payload = read_exact(stream, size, capture=is_binary)
+                          if is_binary:
+                              binary_data = payload
+                          padding = (-size) % 512
+                          if padding:
+                              read_exact(stream, padding, capture=False)
+              if count == 0 or binary_data is None:
+                  raise SystemExit("::error::TAR lacks its exact root platform binary")
+              return binary_data
 
           def validate_executable_header(data, platform):
               goos, goarch = platform
               if goos == "linux":
-                  if len(data) < 20 or data[:4] != b"\x7fELF" or data[5] not in (1, 2):
-                      raise SystemExit("::error::Linux binary lacks a valid ELF header")
-                  endian = "<" if data[5] == 1 else ">"
-                  machine = struct.unpack_from(f"{endian}H", data, 18)[0]
+                  if len(data) < 20 or data[:4] != b"\x7fELF" or data[4] != 2 or data[5] != 1:
+                      raise SystemExit("::error::Linux binary must be little-endian ELF64")
+                  machine = struct.unpack_from("<H", data, 18)[0]
                   expected = {"amd64": 62, "arm64": 183}[goarch]
               elif goos == "darwin":
                   if len(data) < 8 or data[:4] not in (b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf"):
@@ -545,9 +718,12 @@ jobs:
                   if len(data) < 64 or data[:2] != b"MZ":
                       raise SystemExit("::error::Windows binary lacks a valid PE header")
                   pe_offset = struct.unpack_from("<I", data, 0x3C)[0]
-                  if pe_offset + 6 > len(data) or data[pe_offset:pe_offset + 4] != b"PE\x00\x00":
+                  if pe_offset + 26 > len(data) or data[pe_offset:pe_offset + 4] != b"PE\x00\x00":
                       raise SystemExit("::error::Windows binary has an invalid PE offset")
                   machine = struct.unpack_from("<H", data, pe_offset + 4)[0]
+                  optional_magic = struct.unpack_from("<H", data, pe_offset + 24)[0]
+                  if optional_magic != 0x20B:
+                      raise SystemExit("::error::Windows binary is not PE32+")
                   expected = {"amd64": 0x8664, "arm64": 0xAA64}[goarch]
               if machine != expected:
                   raise SystemExit("::error::executable header does not match declared platform architecture")
@@ -564,12 +740,11 @@ jobs:
               archive_size = archive.stat().st_size
               binary_data = None
               if platform[0] == "windows":
-                  if not zipfile.is_zipfile(archive):
-                      raise SystemExit("::error::Windows archive must be ZIP")
+                  expected_entries = preflight_zip(archive)
                   with zipfile.ZipFile(archive) as bundle:
                       infos = bundle.infolist()
-                      if not 1 <= len(infos) <= MAX_ENTRIES:
-                          raise SystemExit("::error::archive entry limit exceeded before payload read")
+                      if len(infos) != expected_entries:
+                          raise SystemExit("::error::ZIP central directory count differs from EOCD preflight")
                       records = []
                       for index, info in enumerate(infos):
                           mode = info.external_attr >> 16
@@ -578,26 +753,17 @@ jobs:
                               raise SystemExit("::error::zip contains directory, link, special, or encrypted member")
                           records.append((info.filename, info.file_size, info.compress_size, mode, index))
                       binary_index, binary_size = validate_members(records, archive_size, expected_binary)
-                      with bundle.open(infos[binary_index]) as stream:
-                          binary_data = read_bounded(stream, binary_size)
+                      for index, info in enumerate(infos):
+                          local_zip_name(archive, info)
+                          with bundle.open(info) as stream:
+                              payload = read_member_bounded(stream, info.file_size, capture=index == binary_index)
+                          if index == binary_index:
+                              binary_data = payload
+                      if len(binary_data) != binary_size:
+                          raise SystemExit("::error::ZIP binary size differs from validated metadata")
               else:
-                  if not tarfile.is_tarfile(archive):
-                      raise SystemExit("::error::Unix archive must be TAR")
-                  with tarfile.open(archive, "r:*") as bundle:
-                      members = []
-                      records = []
-                      for member in bundle:
-                          if len(members) >= MAX_ENTRIES:
-                              raise SystemExit("::error::archive entry limit exceeded before payload read")
-                          if not member.isfile():
-                              raise SystemExit("::error::tar contains directory, link, device, FIFO, or other non-regular member")
-                          records.append((member.name, member.size, None, member.mode, len(members)))
-                          members.append(member)
-                      binary_index, binary_size = validate_members(records, archive_size, expected_binary)
-                      stream = bundle.extractfile(members[binary_index])
-                      if stream is None:
-                          raise SystemExit("::error::binary member cannot be read")
-                      binary_data = read_bounded(stream, binary_size)
+                  binary_data = scan_tar_gz(archive, expected_binary)
+                  binary_size = len(binary_data)
               if len(binary_data) != binary_size:
                   raise SystemExit("::error::binary payload size differs from bounded metadata")
               validate_executable_header(binary_data, platform)
@@ -609,8 +775,13 @@ jobs:
               if not compiler or compiler.group(1) != f"go{os.environ['GO_VERSION']}":
                   raise SystemExit("::error::binary Go compiler version is not an exact match")
               revisions = re.findall(r"(?m)^\s*build\s+vcs\.revision=(\S+)\s*$", result.stdout)
-              if revisions != [os.environ["SOURCE_SHA"]]:
-                  raise SystemExit("::error::binary revision mismatch")
+              modified = re.findall(r"(?m)^\s*build\s+vcs\.modified=(\S+)\s*$", result.stdout)
+              build_goos = re.findall(r"(?m)^\s*build\s+GOOS=(\S+)\s*$", result.stdout)
+              build_goarch = re.findall(r"(?m)^\s*build\s+GOARCH=(\S+)\s*$", result.stdout)
+              if revisions != [os.environ["SOURCE_SHA"]] or modified != ["false"]:
+                  raise SystemExit("::error::binary VCS revision or modified state mismatch")
+              if build_goos != [platform[0]] or build_goarch != [platform[1]]:
+                  raise SystemExit("::error::binary build settings do not match declared GOOS/GOARCH")
           if matrix != EXPECTED_MATRIX:
               raise SystemExit("::error::declared archives do not form the required six-target matrix")
           PY
@@ -634,11 +805,10 @@ jobs:
           BINARY_NAME: ${{ inputs.binary-name }}
         run: |
           python3 - <<'PY'
+          import gzip
           import json
           import os
           from pathlib import Path, PurePosixPath
-          import stat
-          import tarfile
           import tempfile
 
           root = Path("raw").resolve()
@@ -656,29 +826,73 @@ jobs:
           if len(parts) != 2 or parts[0] != "dist" or any(part in ("", ".", "..") or part.startswith(".") for part in parts):
               raise SystemExit("::error::unsafe smoke archive path")
           archive = root / Path(*parts)
-          if not tarfile.is_tarfile(archive):
-              raise SystemExit("::error::linux/amd64 smoke archive must be TAR")
+          if archive.stat().st_size > 256 * 1024 * 1024:
+              raise SystemExit("::error::smoke archive exceeds size limit")
+
+          def octal(field):
+              if field and field[0] & 0x80:
+                  raise SystemExit("::error::smoke TAR uses base-256 metadata")
+              value = field.rstrip(b"\x00 ").lstrip(b" ")
+              if not value or any(byte not in b"01234567" for byte in value):
+                  raise SystemExit("::error::smoke TAR has invalid octal metadata")
+              return int(value, 8)
+
+          def read_exact(stream, size, capture=False):
+              chunks = []
+              remaining = size
+              while remaining:
+                  chunk = stream.read(min(1024 * 1024, remaining))
+                  if not chunk:
+                      raise SystemExit("::error::smoke TAR payload is truncated")
+                  if capture:
+                      chunks.append(chunk)
+                  remaining -= len(chunk)
+              return b"".join(chunks) if capture else None
+
           payloads = []
-          with tarfile.open(archive, "r:*") as bundle:
-              for member in bundle.getmembers():
-                  if member.name == os.environ["BINARY_NAME"] and member.isfile():
-                      if member.size > 256 * 1024 * 1024 or not member.mode & 0o111 or member.mode & 0o7022:
-                          raise SystemExit("::error::smoke binary metadata is unsafe")
-                      stream = bundle.extractfile(member)
-                      if stream is not None:
-                          chunks = []
-                          total = 0
+          count = 0
+          expanded = 0
+          with archive.open("rb") as compressed:
+              if compressed.read(2) != b"\x1f\x8b":
+                  raise SystemExit("::error::linux/amd64 smoke archive must be TAR.GZ")
+              compressed.seek(0)
+              with gzip.GzipFile(fileobj=compressed) as stream:
+                  while True:
+                      header = read_exact(stream, 512, capture=True)
+                      if header == b"\x00" * 512:
+                          trailing = 0
                           while True:
-                              chunk = stream.read(min(1024 * 1024, member.size + 1 - total))
+                              chunk = stream.read(1024 * 1024)
                               if not chunk:
                                   break
-                              chunks.append(chunk)
-                              total += len(chunk)
-                              if total > member.size:
-                                  raise SystemExit("::error::smoke binary exceeds declared size")
-                          if total != member.size:
-                              raise SystemExit("::error::smoke binary size mismatch")
-                          payloads.append(b"".join(chunks))
+                              trailing += len(chunk)
+                              if any(chunk) or trailing > 1024 * 1024:
+                                  raise SystemExit("::error::smoke TAR trailing data is unsafe")
+                          break
+                      count += 1
+                      if count > 128 or header[257:263] != b"ustar\x00" or header[156:157] not in (b"\x00", b"0"):
+                          raise SystemExit("::error::smoke TAR type, format, or count is unsafe")
+                      stored = octal(header[148:156])
+                      if sum(header[:148] + b" " * 8 + header[156:]) != stored:
+                          raise SystemExit("::error::smoke TAR checksum mismatch")
+                      name = header[:100].split(b"\x00", 1)[0].decode("ascii")
+                      prefix = header[345:500].split(b"\x00", 1)[0].decode("ascii")
+                      if prefix:
+                          name = f"{prefix}/{name}"
+                      size = octal(header[124:136])
+                      mode = octal(header[100:108])
+                      expanded += size
+                      if size > 256 * 1024 * 1024 or expanded > 512 * 1024 * 1024 or expanded > max(archive.stat().st_size, 1) * 200:
+                          raise SystemExit("::error::smoke TAR size or ratio limit exceeded")
+                      is_binary = name == os.environ["BINARY_NAME"]
+                      if is_binary and (payloads or not mode & 0o111 or mode & 0o7022):
+                          raise SystemExit("::error::smoke binary metadata is unsafe")
+                      payload = read_exact(stream, size, capture=is_binary)
+                      if is_binary:
+                          payloads.append(payload)
+                      padding = (-size) % 512
+                      if padding:
+                          read_exact(stream, padding)
           if len(payloads) != 1:
               raise SystemExit("::error::exact root smoke binary is absent or ambiguous")
           sandbox = Path(tempfile.mkdtemp(prefix="candidate-smoke-"))

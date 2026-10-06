@@ -168,6 +168,8 @@ snapshot:
   version_template: "{{ incpatch .Version }}-pr.{{ .Env.PR_NUMBER }}.g{{ .ShortCommit }}"
 ```
 
+This template is an explicit opt-in prerequisite. Existing Rootline and Roadmapctl release configurations are not compatible until they adopt it; that is expected and is not a defect in this reusable. Backscroll adoption is being handled separately in PR #105.
+
 The PR must be rebased so `base-sha` is an ancestor of `source-sha`. If the base branch changes, regenerate the candidate with the new base SHA.
 
 Mandatory PR candidates can be wired after caller checks:
@@ -255,7 +257,9 @@ The workflow isolates trust boundaries across fresh jobs:
 
 Top-level permissions are empty. Only `metadata` receives `pull-requests: read`; the API token is scoped to its validation step. Source fetches are anonymous HTTPS and initial support is therefore limited to public repositories. No workflow secret, OIDC permission, write permission, tag, release, or persisted Git credential is used. GitHub artifact/setup actions may use Actions-internal runtime tokens inside their host actions; those tokens are not passed to the candidate process or GoReleaser CLI.
 
-The workflow deliberately builds and smoke-tests untrusted fork code. Fresh runners prevent build persistence from reaching validation or publication, and the candidate executes without credentials in a temporary local environment. It can still consume runner CPU and use unauthenticated network access. No candidate artifact is installed or published unless the complete DAG succeeds and the isolated local smoke verification passes.
+The workflow deliberately builds and smoke-tests untrusted fork code. Fresh runners prevent build persistence from reaching validation or publication, and the candidate executes without credentials in a temporary local environment. It can still consume runner CPU and use unauthenticated network access. A short-lived raw artifact necessarily exists before validation; only the final validated candidate is published after the complete DAG and isolated local smoke verification succeed.
+
+The local suite uses real cross-compiled Go binaries and handcrafted bounded archive fixtures, but does not install GoReleaser. A hosted Backscroll canary using the trusted base configuration is mandatory before merge.
 
 ---
 
