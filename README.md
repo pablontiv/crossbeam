@@ -163,48 +163,73 @@ jobs:
 Resolve the published release ID, enumerate its complete paginated asset inventory, download every asset by API ID, and retain the remote names, sizes, and API digests:
 
 ```bash
-REPO=OWNER/CONSUMER
-TAG=vX.Y.Z
-mkdir -m 700 verify-release verify-release/assets
+set -euo pipefail
+: "${REPO:=OWNER/CONSUMER}"
+: "${TAG:=vX.Y.Z}"
+VERIFY_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/crossbeam-verify.XXXXXX")
+cleanup() { rm -rf -- "$VERIFY_ROOT"; }
+trap cleanup EXIT
+mkdir -m 700 "$VERIFY_ROOT/assets"
+
 RELEASE_ID=$(gh api "repos/$REPO/releases/tags/$TAG" --jq .id)
+[[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
 gh api --paginate "repos/$REPO/releases/$RELEASE_ID/assets?per_page=50" \
-  --jq '.[] | [.id, .name, .size, (.digest // "")] | @tsv' > verify-release/assets.tsv
-python3 - verify-release/assets.tsv <<'PY'
+  --jq '.[] | [.id, .name, .size, (.digest // "")] | @tsv' > "$VERIFY_ROOT/assets.tsv"
+python3 - "$VERIFY_ROOT/assets.tsv" <<'PY'
 from pathlib import Path
 import re
 import sys
+
 rows = [line.split("\t") for line in Path(sys.argv[1]).read_text().splitlines()]
-assert 2 <= len(rows) <= 32
+if not 2 <= len(rows) <= 32:
+    raise SystemExit("release must contain 2..32 assets")
 names, ids, total = [], set(), 0
+devices = {"CON", "PRN", "AUX", "NUL", *(f"COM{n}" for n in range(1, 10)), *(f"LPT{n}" for n in range(1, 10))}
 for row in rows:
-    assert len(row) == 4
+    if len(row) != 4:
+        raise SystemExit("invalid asset row")
     asset_id, name, raw_size, digest = row
-    assert asset_id.isdigit() and int(asset_id) > 0 and asset_id not in ids
-    assert re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name) and not name.endswith(".")
-    assert name.split(".", 1)[0].upper() not in {"CON", "PRN", "AUX", "NUL", *(f"COM{n}" for n in range(1, 10)), *(f"LPT{n}" for n in range(1, 10))}
-    size = int(raw_size)
-    assert 0 < size <= 256 * 1024 * 1024
-    assert not digest or re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
-    ids.add(asset_id); names.append(name); total += size
-assert names.count("checksums.txt") == 1 and len(names) == len(set(names)) == len({name.casefold() for name in names})
-assert next(int(row[2]) for row in rows if row[1] == "checksums.txt") <= 1024 * 1024
-assert total <= 1024 * 1024 * 1024
+    if not asset_id.isdigit() or int(asset_id) <= 0 or asset_id in ids:
+        raise SystemExit("invalid or duplicate asset ID")
+    if (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name) or name.endswith(".")
+            or name.split(".", 1)[0].upper() in devices):
+        raise SystemExit("non-portable asset name")
+    try:
+        size = int(raw_size)
+    except ValueError as error:
+        raise SystemExit("invalid asset size") from error
+    if not 0 < size <= 256 * 1024 * 1024:
+        raise SystemExit("asset size out of bounds")
+    if digest and not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        raise SystemExit("invalid API digest")
+    ids.add(asset_id)
+    names.append(name)
+    total += size
+if names.count("checksums.txt") != 1 or len(names) != len(set(names)) or len(names) != len({name.casefold() for name in names}):
+    raise SystemExit("invalid release inventory")
+if next(int(row[2]) for row in rows if row[1] == "checksums.txt") > 1024 * 1024:
+    raise SystemExit("checksums.txt is too large")
+if total > 1024 * 1024 * 1024:
+    raise SystemExit("release inventory is too large")
 PY
+
 while IFS=$'\t' read -r id name size digest; do
   gh api -H 'Accept: application/octet-stream' "repos/$REPO/releases/assets/$id" \
-    > "verify-release/assets/$name"
-  test "$(wc -c < "verify-release/assets/$name" | tr -d ' ')" = "$size"
-  actual="sha256:$(sha256sum "verify-release/assets/$name" | cut -d' ' -f1)"
+    > "$VERIFY_ROOT/assets/$name"
+  test "$(wc -c < "$VERIFY_ROOT/assets/$name" | tr -d ' ')" = "$size"
+  actual="sha256:$(sha256sum "$VERIFY_ROOT/assets/$name" | cut -d' ' -f1)"
   test -z "$digest" || test "$actual" = "$digest"
-done < verify-release/assets.tsv
-cut -f2 verify-release/assets.tsv | sort > verify-release/remote.names
-find verify-release/assets -maxdepth 1 -type f -exec basename {} \; | sort > verify-release/downloaded.names
-diff -u verify-release/remote.names verify-release/downloaded.names
-grep -v '^checksums\.txt$' verify-release/remote.names > verify-release/payload.names
+done < "$VERIFY_ROOT/assets.tsv"
+
+cut -f2 "$VERIFY_ROOT/assets.tsv" | sort > "$VERIFY_ROOT/remote.names"
+find "$VERIFY_ROOT/assets" -maxdepth 1 -type f -exec basename {} \; | sort > "$VERIFY_ROOT/downloaded.names"
+diff -u "$VERIFY_ROOT/remote.names" "$VERIFY_ROOT/downloaded.names"
+grep -v '^checksums\.txt$' "$VERIFY_ROOT/remote.names" > "$VERIFY_ROOT/payload.names"
 sed -nE 's/^[0-9a-f]{64}  ([A-Za-z0-9][A-Za-z0-9._-]*)$/\1/p' \
-  verify-release/assets/checksums.txt | sort > verify-release/manifest.names
-diff -u verify-release/payload.names verify-release/manifest.names
-cd verify-release/assets
+  "$VERIFY_ROOT/assets/checksums.txt" | sort > "$VERIFY_ROOT/manifest.names"
+diff -u "$VERIFY_ROOT/payload.names" "$VERIFY_ROOT/manifest.names"
+
+cd "$VERIFY_ROOT/assets"
 gh attestation verify checksums.txt --repo "$REPO" \
   --signer-workflow pablontiv/crossbeam/.github/workflows/go-release.yml \
   --cert-identity 'https://github.com/pablontiv/crossbeam/.github/workflows/go-release.yml@refs/tags/v2'

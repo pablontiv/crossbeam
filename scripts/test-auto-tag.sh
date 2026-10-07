@@ -82,6 +82,20 @@ for step_name, filename in (
 PY
 }
 
+extract_readme_verify_script() {
+  python3 - "$README" "$TEST_ROOT/readme-verify.sh" <<'PY'
+from pathlib import Path
+import sys
+
+text = Path(sys.argv[1]).read_text()
+heading = text.index("### Verify a Go release")
+start = text.index("```bash\n", heading) + len("```bash\n")
+end = text.index("\n```", start)
+Path(sys.argv[2]).write_text(text[start:end] + "\n")
+PY
+  chmod +x "$TEST_ROOT/readme-verify.sh"
+}
+
 record() {
   local name=$1 expected=$2 actual=$3
   if [[ "$actual" == "$expected" ]]; then
@@ -730,11 +744,36 @@ release_block, attest_block = lines[release:attest], lines[attest:]
 steps = next(i for i, line in enumerate(attest_block) if line == "    steps:")
 header = attest_block[:steps]
 def value(prefix): return next((line.strip() for line in header if line.strip().startswith(prefix)), "missing")
-permissions = {line.strip() for line in header if line.startswith("      ") and ":" in line}
+
+try:
+    import yaml
+except ImportError as error:
+    raise SystemExit(f"PyYAML is required to parse workflow YAML: {error}") from error
+try:
+    workflow = yaml.safe_load(Path(sys.argv[1]).read_text())
+except yaml.YAMLError as error:
+    raise SystemExit(f"could not parse workflow YAML: {error}") from error
+
+expected_permissions = {
+    "auto-tag": {"contents": "write"},
+    "release": {"contents": "write"},
+    "attest": {"contents": "read", "id-token": "write", "attestations": "write"},
+}
+jobs = workflow.get("jobs")
+parsed_permissions = (
+    {name: job.get("permissions") for name, job in jobs.items()}
+    if isinstance(jobs, dict) and all(isinstance(job, dict) for job in jobs.values())
+    else None
+)
+permission_result = (
+    "exact"
+    if workflow.get("permissions") == {} and parsed_permissions == expected_permissions
+    else str(parsed_permissions)
+)
 joined = "\n".join(attest_block)
 print("clean" if not any("Validate published release assets" in line or "Generate SLSA attestation" in line for line in release_block) else "mixed")
 print(value("needs:")); print(value("runs-on:"))
-print("exact" if permissions == {"contents: read", "id-token: write", "attestations: write"} else ",".join(sorted(permissions)))
+print(permission_result)
 print("absent" if "actions/checkout" not in joined else "present")
 print("absent" if not any(token in joined for token in ("Smoke test binary", "chmod +x", "--version")) else "present")
 print("present" if all(token in joined for token in (
@@ -750,7 +789,7 @@ PY
   record "release job excludes validation and attestation" "clean" "$(printf '%s\n' "$metadata" | sed -n '1p')"
   record "attest job needs release" "needs: release" "$(printf '%s\n' "$metadata" | sed -n '2p')"
   record "attest job uses fresh pinned runner" "runs-on: ubuntu-24.04" "$(printf '%s\n' "$metadata" | sed -n '3p')"
-  record "attest job permissions are minimal" "exact" "$(printf '%s\n' "$metadata" | sed -n '4p')"
+  record "every release job has exact scoped permissions" "exact" "$(printf '%s\n' "$metadata" | sed -n '4p')"
   record "attest job has no checkout" "absent" "$(printf '%s\n' "$metadata" | sed -n '5p')"
   record "attest job does not execute release binaries" "absent" "$(printf '%s\n' "$metadata" | sed -n '6p')"
   record "attest job downloads release tag ref and assets" "present" "$(printf '%s\n' "$metadata" | sed -n '7p')"
@@ -761,8 +800,80 @@ PY
   record "attestation has no path or checksums reopening" "absent" "$(printf '%s\n' "$metadata" | sed -n '11p')"
 }
 
+run_readme_verification_case() {
+  local name=$1 mode=$2 expected=$3
+  local repo="$TEST_ROOT/readme-${name//[^a-zA-Z0-9]/-}"
+  local remote="$repo/remote" status=0 actual=success
+  mkdir -p "$remote/assets" "$repo/fake-bin" "$repo/tmp"
+  printf '%s\n' 'first published asset' > "$remote/assets/first.tar.gz"
+  printf '%s\n' 'second published asset' > "$remote/assets/second.zip"
+  (cd "$remote/assets" && sha256sum first.tar.gz second.zip > checksums.txt)
+  python3 - "$remote" <<'PY'
+import hashlib
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+rows = []
+for asset_id, name in enumerate(("checksums.txt", "first.tar.gz", "second.zip"), 101):
+    data = (root / "assets" / name).read_bytes()
+    rows.append(f"{asset_id}\t{name}\t{len(data)}\tsha256:{hashlib.sha256(data).hexdigest()}")
+(root / "assets.tsv").write_text("\n".join(rows) + "\n")
+bad = rows.copy()
+bad[1] = bad[1].rsplit("\t", 1)[0] + "\tsha256:" + "0" * 64
+(root / "assets-bad.tsv").write_text("\n".join(bad) + "\n")
+PY
+  cat > "$repo/fake-bin/gh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "${1-}" == attestation && "${2-}" == verify ]]; then
+  [[ "$FIXTURE_MODE" != attestation-failure ]]
+  exit
+fi
+case "$*" in
+  *releases/tags/v1.2.3*) printf '%s\n' 77 ;;
+  *releases/77/assets?per_page=50*)
+    if [[ "$FIXTURE_MODE" == digest-mismatch ]]; then
+      cat "$GH_FIXTURE/assets-bad.tsv"
+    else
+      cat "$GH_FIXTURE/assets.tsv"
+    fi
+    ;;
+  *releases/assets/101*) cat "$GH_FIXTURE/assets/checksums.txt" ;;
+  *releases/assets/102*) cat "$GH_FIXTURE/assets/first.tar.gz" ;;
+  *releases/assets/103*) cat "$GH_FIXTURE/assets/second.zip" ;;
+  *) printf 'unexpected gh invocation: %s\n' "$*" >&2; exit 2 ;;
+esac
+SH
+  cat > "$repo/fake-bin/find" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+"$REAL_FIND" "$@"
+if [[ "$FIXTURE_MODE" == inventory-diff ]]; then
+  printf '%s\n' unexpected.bin
+fi
+SH
+  cat > "$repo/fake-bin/mkdir" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+if [[ "$FIXTURE_MODE" == mkdir-failure ]]; then
+  exit 73
+fi
+exec "$REAL_MKDIR" "$@"
+SH
+  chmod +x "$repo/fake-bin/gh" "$repo/fake-bin/find" "$repo/fake-bin/mkdir"
+
+  PATH="$repo/fake-bin:$PATH" GH_FIXTURE="$remote" FIXTURE_MODE="$mode" \
+    REAL_FIND="$(command -v find)" REAL_MKDIR="$(command -v mkdir)" \
+    TMPDIR="$repo/tmp" REPO=owner/repo TAG=v1.2.3 \
+    bash "$TEST_ROOT/readme-verify.sh" >"$repo/run.log" 2>&1 || status=$?
+  (( status == 0 )) || actual=failure
+  record "$name" "$expected" "$actual"
+  record "$name removes temporary verification state" empty \
+    "$([[ -z "$(find "$repo/tmp" -mindepth 1 -print -quit)" ]] && echo empty || echo retained)"
+}
+
 assert_readme_signer_ref_consistency() {
-  local metadata examples identity guidance signer pagination inventory_warning
+  local metadata examples identity guidance signer pagination inventory_warning shell_safety
   metadata=$(python3 - "$README" <<'PY'
 from pathlib import Path
 import re
@@ -780,9 +891,14 @@ print("present" if "@refs/tags/v1" in text and "@<exact-40-character-crossbeam-S
 print("present" if "--signer-workflow pablontiv/crossbeam/.github/workflows/go-release.yml" in text else "missing")
 print("present" if all(value in text for value in (
     "RELEASE_ID=$(gh api", "gh api --paginate", "/releases/$RELEASE_ID/assets?per_page=50",
-    "(.digest //", "verify-release/remote.names", "verify-release/downloaded.names",
+    "(.digest //", '"$VERIFY_ROOT/remote.names"', '"$VERIFY_ROOT/downloaded.names"',
 )) else "missing")
 print("present" if "sha256sum --check` alone" in text and "remote release inventory" in text else "missing")
+heading = text.index("### Verify a Go release")
+start = text.index("```bash\n", heading) + len("```bash\n")
+end = text.index("\n```", start)
+block = text[start:end]
+print("present" if block.splitlines()[0] == "set -euo pipefail" and 'trap cleanup EXIT' in block else "missing")
 PY
 )
   examples=$(printf '%s\n' "$metadata" | sed -n '1p')
@@ -791,17 +907,20 @@ PY
   signer=$(printf '%s\n' "$metadata" | sed -n '4p')
   pagination=$(printf '%s\n' "$metadata" | sed -n '5p')
   inventory_warning=$(printf '%s\n' "$metadata" | sed -n '6p')
+  shell_safety=$(printf '%s\n' "$metadata" | sed -n '7p')
   record "README release examples use v2" "v2" "$examples"
   record "README verifier identity uses v2" "v2" "$identity"
   record "README explains v1 and SHA signer refs" "present" "$guidance"
   record "README uses signer-workflow without ref" "present" "$signer"
   record "README enumerates paginated release assets" "present" "$pagination"
   record "README does not equate sha256sum with inventory proof" "present" "$inventory_warning"
+  record "README recipe enables strict mode and cleanup trap" "present" "$shell_safety"
 }
 
 extract_release_script
 extract_smoke_script
 extract_attest_scripts
+extract_readme_verify_script
 
 echo "=== Post-1.0 policy ==="
 run_case "breaking defaults to minor" v2.3.4 5 "" v2.4.0 true feat \
@@ -900,6 +1019,11 @@ run_published_asset_case "symlink published asset fails" symlink-asset failure
 run_published_asset_case "symlink checksum manifest fails" symlink-checksum failure
 run_published_asset_case "concurrent published asset mutation fails" concurrent-mutation failure
 assert_isolated_attestation_job
+run_readme_verification_case "README verification recipe passes valid release" valid success
+run_readme_verification_case "README verification fails on attestation error" attestation-failure failure
+run_readme_verification_case "README verification fails on inventory diff" inventory-diff failure
+run_readme_verification_case "README verification fails on API digest mismatch" digest-mismatch failure
+run_readme_verification_case "README verification fails when mkdir fails" mkdir-failure failure
 assert_readme_signer_ref_consistency
 
 echo ""
