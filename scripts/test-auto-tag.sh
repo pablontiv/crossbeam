@@ -389,24 +389,78 @@ PY
 run_checksum_case() {
   local name=$1 fixture=$2 expected=$3
   local repo="$TEST_ROOT/checksum-${name//[^a-zA-Z0-9]/-}"
-  local status=0 actual=success
-  mkdir -p "$repo/dist"
+  local status=0 actual=success first_line
+  mkdir -p "$repo/dist/intermediate"
 
   printf '%s\n' 'first asset' > "$repo/dist/first.tar.gz"
   printf '%s\n' 'second asset' > "$repo/dist/second.zip"
+  printf '%s\n' 'intermediate binary' > "$repo/dist/intermediate/tool"
+  cat > "$repo/dist/artifacts.json" <<'JSON'
+[
+  {"type":"Archive","name":"first","path":"dist/first.tar.gz"},
+  {"type":"Archive","name":"second","path":"dist/second.zip"},
+  {"type":"Binary","name":"tool","path":"dist/intermediate/tool"},
+  {"type":"Metadata","name":"metadata","path":"dist/metadata.json"},
+  {"type":"Checksum","name":"checksums","path":"dist/checksums.txt"}
+]
+JSON
+  (cd "$repo/dist" && sha256sum first.tar.gz second.zip > checksums.txt)
+
   case "$fixture" in
-    missing) ;;
+    valid) ;;
+    missing-file)
+      rm "$repo/dist/checksums.txt"
+      ;;
+    missing-entry)
+      first_line=$(head -n 1 "$repo/dist/checksums.txt")
+      printf '%s\n' "$first_line" > "$repo/dist/checksums.txt"
+      ;;
     tampered)
-      (cd "$repo/dist" && sha256sum first.tar.gz second.zip > checksums.txt)
       printf '%s\n' 'tampered' >> "$repo/dist/first.tar.gz"
       ;;
-    extra)
+    extra-existing)
       printf '%s\n' 'not published' > "$repo/dist/extra.tar.gz"
-      (cd "$repo/dist" && sha256sum first.tar.gz second.zip extra.tar.gz > checksums.txt)
-      rm "$repo/dist/extra.tar.gz"
+      (cd "$repo/dist" && sha256sum extra.tar.gz >> checksums.txt)
       ;;
-    correct)
-      (cd "$repo/dist" && sha256sum first.tar.gz second.zip > checksums.txt)
+    duplicate)
+      first_line=$(head -n 1 "$repo/dist/checksums.txt")
+      printf '%s\n' "$first_line" >> "$repo/dist/checksums.txt"
+      ;;
+    traversal)
+      printf '%064d  ../outside.tar.gz\n' 0 >> "$repo/dist/checksums.txt"
+      ;;
+    absolute)
+      printf '%064d  /tmp/absolute.tar.gz\n' 0 >> "$repo/dist/checksums.txt"
+      ;;
+    artifacts-shape)
+      printf '%s\n' '{"artifacts": []}' > "$repo/dist/artifacts.json"
+      ;;
+    checksum-shape)
+      python3 - "$repo/dist/artifacts.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+artifacts = json.loads(path.read_text())
+artifacts[-1]["path"] = "dist/sums.txt"
+path.write_text(json.dumps(artifacts))
+PY
+      ;;
+    manifest-traversal)
+      python3 - "$repo/dist/artifacts.json" <<'PY'
+import json
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+artifacts = json.loads(path.read_text())
+artifacts[0]["path"] = "dist/../first.tar.gz"
+path.write_text(json.dumps(artifacts))
+PY
+      ;;
+    symlink)
+      cp "$repo/dist/first.tar.gz" "$repo/outside.tar.gz"
+      rm "$repo/dist/first.tar.gz"
+      ln -s ../outside.tar.gz "$repo/dist/first.tar.gz"
       ;;
     *)
       printf 'unknown checksum fixture: %s\n' "$fixture" >&2
@@ -521,10 +575,18 @@ assert_empty_binary_name_preserves_static_skip
 
 echo ""
 echo "=== Go release checksum and attestation gate ==="
-run_checksum_case "missing checksum fails" missing failure
-run_checksum_case "tampered asset fails" tampered failure
-run_checksum_case "extra checksum fails" extra failure
-run_checksum_case "correct checksums pass" correct success
+run_checksum_case "valid archive checksums pass" valid success
+run_checksum_case "missing checksum file fails" missing-file failure
+run_checksum_case "missing archive checksum fails" missing-entry failure
+run_checksum_case "tampered archive fails" tampered failure
+run_checksum_case "extra existing checksum fails" extra-existing failure
+run_checksum_case "duplicate checksum fails" duplicate failure
+run_checksum_case "traversing checksum fails" traversal failure
+run_checksum_case "absolute checksum fails" absolute failure
+run_checksum_case "artifacts root shape mismatch fails" artifacts-shape failure
+run_checksum_case "checksum artifact shape mismatch fails" checksum-shape failure
+run_checksum_case "manifest traversal fails" manifest-traversal failure
+run_checksum_case "symlink archive fails" symlink failure
 assert_attestation_is_fail_closed_and_ordered
 
 echo ""

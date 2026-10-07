@@ -264,15 +264,116 @@ jobs:
 
       - name: Verify release checksums
         run: |
-          set -euo pipefail
-          if [[ ! -s dist/checksums.txt ]]; then
-            echo "::error::dist/checksums.txt is missing or empty"
-            exit 1
-          fi
-          (
-            cd dist
-            sha256sum --strict --check checksums.txt
-          )
+          python3 - <<'PY'
+          import hashlib
+          import json
+          from pathlib import Path
+          import re
+          import stat
+
+          dist = Path("dist")
+          if dist.is_symlink() or not dist.is_dir():
+              raise SystemExit("::error::dist must be a real directory")
+
+          control_limit = 4 * 1024 * 1024
+          basename_pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+          windows_devices = {
+              "CON", "PRN", "AUX", "NUL",
+              *(f"COM{number}" for number in range(1, 10)),
+              *(f"LPT{number}" for number in range(1, 10)),
+          }
+
+          def regular(path):
+              try:
+                  metadata = path.lstat()
+              except OSError as error:
+                  raise SystemExit(f"::error::missing release file {path}: {error}") from error
+              if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
+                  raise SystemExit(f"::error::release file is not regular: {path}")
+              return path
+
+          def read_control(path):
+              path = regular(path)
+              try:
+                  with path.open("rb") as stream:
+                      data = stream.read(control_limit + 1)
+              except OSError as error:
+                  raise SystemExit(f"::error::cannot read release file {path}: {error}") from error
+              if len(data) > control_limit:
+                  raise SystemExit(f"::error::release control file is too large: {path}")
+              try:
+                  return data.decode("utf-8")
+              except UnicodeDecodeError as error:
+                  raise SystemExit(f"::error::release control file is not UTF-8: {path}") from error
+
+          def portable_basename(value):
+              if (not isinstance(value, str) or not basename_pattern.fullmatch(value)
+                      or value in (".", "..") or value.endswith((".", " "))
+                      or value.split(".", 1)[0].upper() in windows_devices):
+                  raise SystemExit(f"::error::non-portable release basename: {value!r}")
+              return value
+
+          try:
+              artifacts = json.loads(read_control(dist / "artifacts.json"))
+          except json.JSONDecodeError as error:
+              raise SystemExit(f"::error::invalid artifacts.json: {error}") from error
+          if not isinstance(artifacts, list) or not all(isinstance(item, dict) for item in artifacts):
+              raise SystemExit("::error::artifacts.json must use GoReleaser's direct-list shape")
+
+          archives = [item for item in artifacts if item.get("type") == "Archive"]
+          checksum_items = [item for item in artifacts if item.get("type") == "Checksum"]
+          if not archives or len(checksum_items) != 1 or checksum_items[0].get("path") != "dist/checksums.txt":
+              raise SystemExit("::error::expected archives and exactly one dist/checksums.txt artifact")
+
+          expected_names = []
+          for item in archives:
+              raw_path = item.get("path")
+              if not isinstance(raw_path, str) or not raw_path.startswith("dist/"):
+                  raise SystemExit("::error::archive path must be literal dist/basename")
+              name = portable_basename(raw_path.removeprefix("dist/"))
+              if raw_path != f"dist/{name}":
+                  raise SystemExit("::error::archive path must be literal dist/basename")
+              regular(dist / name)
+              expected_names.append(name)
+
+          expected_casefold = [name.casefold() for name in expected_names]
+          if len(set(expected_names)) != len(expected_names) or len(set(expected_casefold)) != len(expected_casefold):
+              raise SystemExit("::error::duplicate or case-colliding archive paths in artifacts.json")
+
+          checksum_path = regular(dist / "checksums.txt")
+          checksum_text = read_control(checksum_path)
+          if not checksum_text.endswith("\n") or "\r" in checksum_text:
+              raise SystemExit("::error::checksums.txt must contain LF-terminated lines")
+          checksum_lines = checksum_text[:-1].split("\n")
+          declared = {}
+          declared_casefold = set()
+          for line in checksum_lines:
+              match = re.fullmatch(r"([0-9a-f]{64})  ([A-Za-z0-9][A-Za-z0-9._-]*)", line)
+              if not match:
+                  raise SystemExit("::error::invalid checksum line")
+              digest, name = match.groups()
+              portable_basename(name)
+              folded = name.casefold()
+              if name in declared or folded in declared_casefold:
+                  raise SystemExit("::error::duplicate or case-colliding checksum basename")
+              declared[name] = digest
+              declared_casefold.add(folded)
+
+          if set(declared) != set(expected_names) or len(declared) != len(expected_names):
+              raise SystemExit("::error::checksum names do not exactly match published archives")
+
+          for name in expected_names:
+              digest = hashlib.sha256()
+              try:
+                  with regular(dist / name).open("rb") as stream:
+                      while chunk := stream.read(1024 * 1024):
+                          digest.update(chunk)
+              except OSError as error:
+                  raise SystemExit(f"::error::cannot hash release asset {name}: {error}") from error
+              if digest.hexdigest() != declared[name]:
+                  raise SystemExit(f"::error::checksum mismatch for {name}")
+              print(f"{name}: OK")
+          PY
 
       - name: Generate SLSA attestation
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
