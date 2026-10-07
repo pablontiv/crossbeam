@@ -160,16 +160,60 @@ jobs:
 
 ### Verify a Go release
 
-Download `checksums.txt` and all release assets, verify the attestation on the checksum manifest, and only then verify every asset from the download directory:
+Resolve the published release ID, enumerate its complete paginated asset inventory, download every asset by API ID, and retain the remote names, sizes, and API digests:
 
 ```bash
-gh release download TAG --repo OWNER/CONSUMER --dir release
-cd release
-gh attestation verify checksums.txt --repo OWNER/CONSUMER --cert-identity 'https://github.com/pablontiv/crossbeam/.github/workflows/go-release.yml@refs/tags/v2'
+REPO=OWNER/CONSUMER
+TAG=vX.Y.Z
+mkdir -m 700 verify-release verify-release/assets
+RELEASE_ID=$(gh api "repos/$REPO/releases/tags/$TAG" --jq .id)
+gh api --paginate "repos/$REPO/releases/$RELEASE_ID/assets?per_page=50" \
+  --jq '.[] | [.id, .name, .size, (.digest // "")] | @tsv' > verify-release/assets.tsv
+python3 - verify-release/assets.tsv <<'PY'
+from pathlib import Path
+import re
+import sys
+rows = [line.split("\t") for line in Path(sys.argv[1]).read_text().splitlines()]
+assert 2 <= len(rows) <= 32
+names, ids, total = [], set(), 0
+for row in rows:
+    assert len(row) == 4
+    asset_id, name, raw_size, digest = row
+    assert asset_id.isdigit() and int(asset_id) > 0 and asset_id not in ids
+    assert re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name) and not name.endswith(".")
+    assert name.split(".", 1)[0].upper() not in {"CON", "PRN", "AUX", "NUL", *(f"COM{n}" for n in range(1, 10)), *(f"LPT{n}" for n in range(1, 10))}
+    size = int(raw_size)
+    assert 0 < size <= 256 * 1024 * 1024
+    assert not digest or re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+    ids.add(asset_id); names.append(name); total += size
+assert names.count("checksums.txt") == 1 and len(names) == len(set(names)) == len({name.casefold() for name in names})
+assert next(int(row[2]) for row in rows if row[1] == "checksums.txt") <= 1024 * 1024
+assert total <= 1024 * 1024 * 1024
+PY
+while IFS=$'\t' read -r id name size digest; do
+  gh api -H 'Accept: application/octet-stream' "repos/$REPO/releases/assets/$id" \
+    > "verify-release/assets/$name"
+  test "$(wc -c < "verify-release/assets/$name" | tr -d ' ')" = "$size"
+  actual="sha256:$(sha256sum "verify-release/assets/$name" | cut -d' ' -f1)"
+  test -z "$digest" || test "$actual" = "$digest"
+done < verify-release/assets.tsv
+cut -f2 verify-release/assets.tsv | sort > verify-release/remote.names
+find verify-release/assets -maxdepth 1 -type f -exec basename {} \; | sort > verify-release/downloaded.names
+diff -u verify-release/remote.names verify-release/downloaded.names
+grep -v '^checksums\.txt$' verify-release/remote.names > verify-release/payload.names
+sed -nE 's/^[0-9a-f]{64}  ([A-Za-z0-9][A-Za-z0-9._-]*)$/\1/p' \
+  verify-release/assets/checksums.txt | sort > verify-release/manifest.names
+diff -u verify-release/payload.names verify-release/manifest.names
+cd verify-release/assets
+gh attestation verify checksums.txt --repo "$REPO" \
+  --signer-workflow pablontiv/crossbeam/.github/workflows/go-release.yml \
+  --cert-identity 'https://github.com/pablontiv/crossbeam/.github/workflows/go-release.yml@refs/tags/v2'
 sha256sum --strict --check checksums.txt
 ```
 
-The certificate identity names Crossbeam's reusable release workflow because it is the signer, while `OWNER/CONSUMER` is the repository that owns the release and attestation. The identity above is valid only when the caller uses `go-release.yml@v2`. A caller pinned to `@v1` must use `@refs/tags/v1` in the certificate identity, and a caller pinned to a full commit SHA must use that exact SHA suffix. Version 2 downloads the actual published release assets into a fresh job, validates the exact remote inventory and every checksum without executing release binaries, and only then attests `checksums.txt`. Because this gate runs after GoReleaser publishes, a checksum, download, or attestation failure fails the workflow but does not withdraw a release that is already published.
+The inventory and API-digest comparisons are essential: `sha256sum --check` alone verifies only names present in `checksums.txt` and does not prove that the manifest covers the complete remote release inventory. `OWNER/CONSUMER` is the consumer repository that owns the release and attestation. `--signer-workflow` selects Crossbeam's reusable workflow path without a ref; `--cert-identity` separately pins the certificate SAN to the exact reusable-workflow ref. The SAN suffix is `@refs/tags/v2` for a `@v2` caller, `@refs/tags/v1` for a `@v1` caller, or `@<exact-40-character-crossbeam-SHA>` for a SHA-pinned caller. That Crossbeam signer/source SHA is distinct from both the consumer release commit and the attested SHA-256 digest of `checksums.txt`.
+
+Version 2 downloads bounded, paginated published assets into a fresh job, validates the exact remote inventory and every checksum without executing release binaries, and only then attests `checksums.txt`. Because this gate runs after GoReleaser publishes, an inventory, checksum, download, or attestation failure fails the workflow but does not withdraw a release that is already published.
 
 ### Go PR candidate artifacts
 

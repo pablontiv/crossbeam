@@ -284,24 +284,42 @@ jobs:
           API_URL: ${{ github.api_url }}
           SERVER_URL: ${{ github.server_url }}
         run: |
-          set -euo pipefail
-          umask 077
-
-          ROOT=$(mktemp -d "${RUNNER_TEMP}/go-release-attest.XXXXXX")
-          ASSET_DIR="$ROOT/assets"
-          mkdir "$ASSET_DIR"
-
-          gh api "/repos/${REPOSITORY}/releases/tags/${RELEASE_TAG}" > "$ROOT/release.json"
-          gh api "/repos/${REPOSITORY}/git/ref/tags/${RELEASE_TAG}" > "$ROOT/tag.json"
-
-          python3 - "$ROOT" <<'PY'
+          python3 - <<'PY'
+          import hashlib
           import json
           import os
           from pathlib import Path
           import re
-          import sys
+          import stat
+          import tempfile
+          from urllib.error import HTTPError
+          from urllib.parse import quote, urlencode, urljoin, urlparse
+          from urllib.request import HTTPRedirectHandler, Request, build_opener
 
-          root = Path(sys.argv[1])
+          MAX_JSON = 1024 * 1024
+          MAX_ASSETS = 32
+          MAX_ASSET = 256 * 1024 * 1024
+          MAX_TOTAL = 1024 * 1024 * 1024
+          MAX_MANIFEST = 1024 * 1024
+          MAX_REDIRECTS = 3
+          PAGE_SIZE = 50
+          CHUNK = 1024 * 1024
+          REDIRECT_HOSTS = {
+              "release-assets.githubusercontent.com",
+              "objects.githubusercontent.com",
+              "github-releases.githubusercontent.com",
+          }
+          PORTABLE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+          DEVICES = {"CON", "PRN", "AUX", "NUL", *(f"COM{n}" for n in range(1, 10)), *(f"LPT{n}" for n in range(1, 10))}
+
+          class NoRedirect(HTTPRedirectHandler):
+              def redirect_request(self, request, file_pointer, code, message, headers, new_url):
+                  return None
+
+          OPENER = build_opener(NoRedirect)
+
+          def fail(message):
+              raise SystemExit(f"::error::{message}")
 
           def unique_object(pairs):
               value = {}
@@ -314,81 +332,223 @@ jobs:
           def reject_constant(value):
               raise ValueError(f"non-finite JSON number: {value}")
 
-          def load(name):
-              path = root / name
-              if path.stat().st_size > 4 * 1024 * 1024:
-                  raise SystemExit(f"::error::GitHub API response is too large: {name}")
+          def bounded_read(response, maximum, label):
+              raw_length = response.headers.get("Content-Length")
+              if raw_length is not None:
+                  try:
+                      length = int(raw_length)
+                  except ValueError as error:
+                      fail(f"invalid Content-Length for {label}: {error}")
+                  if length < 0 or length > maximum:
+                      fail(f"{label} exceeds its byte limit")
+              chunks = []
+              total = 0
+              while True:
+                  chunk = response.read(min(64 * 1024, maximum + 1 - total))
+                  if not chunk:
+                      break
+                  chunks.append(chunk)
+                  total += len(chunk)
+                  if total > maximum:
+                      fail(f"{label} exceeds its byte limit")
+              return b"".join(chunks)
+
+          def open_response(request):
+              try:
+                  return OPENER.open(request, timeout=30)
+              except HTTPError as error:
+                  return error
+
+          def api_json(url, token, label):
+              request = Request(url, headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {token}",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              })
+              response = open_response(request)
+              try:
+                  if response.status != 200:
+                      fail(f"GitHub API returned HTTP {response.status} for {label}")
+                  data = bounded_read(response, MAX_JSON, label)
+              finally:
+                  response.close()
               try:
                   return json.loads(
-                      path.read_text(encoding="utf-8"),
+                      data.decode("utf-8"),
                       object_pairs_hook=unique_object,
                       parse_constant=reject_constant,
-                  )
-              except (OSError, UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
-                  raise SystemExit(f"::error::invalid GitHub API response {name}: {error}") from error
+                  ), data
+              except (UnicodeDecodeError, json.JSONDecodeError, ValueError) as error:
+                  fail(f"invalid bounded JSON for {label}: {error}")
 
-          repository = os.environ["REPOSITORY"]
-          tag = os.environ["RELEASE_TAG"]
-          api_url = os.environ["API_URL"].rstrip("/")
-          server_url = os.environ["SERVER_URL"].rstrip("/")
-          if not tag or repository != os.environ["EVENT_REPOSITORY"]:
-              raise SystemExit("::error::release repository or tag does not match the workflow event")
+          def portable_name(value):
+              if (not isinstance(value, str) or not PORTABLE.fullmatch(value)
+                      or value in (".", "..") or value.endswith((".", " "))
+                      or value.split(".", 1)[0].upper() in DEVICES):
+                  fail("release asset name is not a portable basename")
+              return value
 
-          release = load("release.json")
-          tag_ref = load("tag.json")
-          if not isinstance(release, dict) or not isinstance(tag_ref, dict):
-              raise SystemExit("::error::GitHub release or tag response has an invalid shape")
-          release_id = release.get("id")
-          expected_release_url = f"{api_url}/repos/{repository}/releases/{release_id}"
-          expected_assets_url = f"{expected_release_url}/assets"
-          expected_html_url = f"{server_url}/{repository}/releases/tag/{tag}"
-          if (isinstance(release_id, bool) or not isinstance(release_id, int)
-                  or release.get("tag_name") != tag or release.get("url") != expected_release_url
-                  or release.get("assets_url") != expected_assets_url
-                  or release.get("html_url") != expected_html_url or release.get("draft") is not False):
-              raise SystemExit("::error::published release identity does not match the workflow event")
-          reference = tag_ref.get("object")
-          if (tag_ref.get("ref") != f"refs/tags/{tag}" or not isinstance(reference, dict)
-                  or reference.get("type") != "commit" or reference.get("sha") != os.environ["EVENT_SHA"]):
-              raise SystemExit("::error::release tag does not resolve to the workflow event commit")
+          def enumerate_assets(api_url, repository, release_id, token):
+              assets = []
+              seen_ids = set()
+              seen_names = set()
+              seen_folded = set()
+              page = 1
+              while True:
+                  query = urlencode({"per_page": PAGE_SIZE, "page": page})
+                  endpoint = f"{api_url}/repos/{repository}/releases/{release_id}/assets?{query}"
+                  values, _ = api_json(endpoint, token, f"release assets page {page}")
+                  if not isinstance(values, list):
+                      fail("release assets page must be a JSON list")
+                  for asset in values:
+                      if len(assets) >= MAX_ASSETS:
+                          fail(f"release has more than {MAX_ASSETS} assets")
+                      if not isinstance(asset, dict):
+                          fail("release asset record must be an object")
+                      asset_id = asset.get("id")
+                      name = portable_name(asset.get("name"))
+                      size = asset.get("size")
+                      digest = asset.get("digest")
+                      if (isinstance(asset_id, bool) or not isinstance(asset_id, int) or asset_id <= 0
+                              or asset_id in seen_ids):
+                          fail("release asset ID is invalid or duplicated")
+                      if name in seen_names or name.casefold() in seen_folded:
+                          fail("release asset name is duplicated or case-colliding")
+                      if isinstance(size, bool) or not isinstance(size, int) or size <= 0 or size > MAX_ASSET:
+                          fail("release asset size is invalid or exceeds 256 MiB")
+                      if digest is not None and (not isinstance(digest, str)
+                              or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest)):
+                          fail("release asset API digest is malformed")
+                      seen_ids.add(asset_id)
+                      seen_names.add(name)
+                      seen_folded.add(name.casefold())
+                      assets.append({"id": asset_id, "name": name, "size": size, "digest": digest})
+                  if len(values) < PAGE_SIZE:
+                      break
+                  page += 1
+              if sum(asset["name"] == "checksums.txt" for asset in assets) != 1 or len(assets) < 2:
+                  fail("release must contain exactly one checksums.txt and at least one other asset")
+              if next(asset["size"] for asset in assets if asset["name"] == "checksums.txt") > MAX_MANIFEST:
+                  fail("checksums.txt exceeds 1 MiB")
+              if sum(asset["size"] for asset in assets) > MAX_TOTAL:
+                  fail("release assets exceed the 1 GiB aggregate limit")
+              return assets
 
-          assets = release.get("assets")
-          if not isinstance(assets, list):
-              raise SystemExit("::error::release assets must be a list")
-          pattern = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
-          devices = {"CON", "PRN", "AUX", "NUL", *(f"COM{n}" for n in range(1, 10)), *(f"LPT{n}" for n in range(1, 10))}
-          names = []
-          downloads = []
-          for asset in assets:
-              if not isinstance(asset, dict):
-                  raise SystemExit("::error::release asset record must be an object")
-              asset_id, name, size = asset.get("id"), asset.get("name"), asset.get("size")
-              expected_url = f"{api_url}/repos/{repository}/releases/assets/{asset_id}"
-              if (isinstance(asset_id, bool) or not isinstance(asset_id, int) or asset_id <= 0
-                      or not isinstance(name, str) or not pattern.fullmatch(name)
-                      or name in (".", "..") or name.endswith((".", " "))
-                      or name.split(".", 1)[0].upper() in devices
-                      or isinstance(size, bool) or not isinstance(size, int) or size < 0
-                      or asset.get("url") != expected_url):
-                  raise SystemExit("::error::release asset metadata is malformed or non-portable")
-              names.append(name)
-              downloads.append((asset_id, name))
-          if names.count("checksums.txt") != 1 or len(names) < 2:
-              raise SystemExit("::error::release must contain one checksums.txt and at least one other asset")
-          if len(set(names)) != len(names) or len({name.casefold() for name in names}) != len(names):
-              raise SystemExit("::error::release asset names duplicate or collide")
+          def download_asset(api_url, repository, asset, token, directory_fd):
+              endpoint = f"{api_url}/repos/{repository}/releases/assets/{asset['id']}"
+              url = endpoint
+              redirects = 0
+              authorization = token
+              response = None
+              while True:
+                  headers = {"Accept": "application/octet-stream"}
+                  if authorization is not None:
+                      headers["Authorization"] = f"Bearer {authorization}"
+                      headers["X-GitHub-Api-Version"] = "2022-11-28"
+                  response = open_response(Request(url, headers=headers))
+                  if response.status == 200:
+                      break
+                  if response.status not in (301, 302, 303, 307, 308):
+                      response.close()
+                      fail(f"asset download returned HTTP {response.status}: {asset['name']}")
+                  location = response.headers.get("Location")
+                  response.close()
+                  redirects += 1
+                  if redirects > MAX_REDIRECTS or not location:
+                      fail(f"asset redirect limit or location is invalid: {asset['name']}")
+                  target = urlparse(urljoin(url, location))
+                  if (target.scheme != "https" or target.username is not None or target.password is not None
+                          or target.hostname not in REDIRECT_HOSTS or target.port not in (None, 443)):
+                      fail(f"asset redirect host is not allowed: {asset['name']}")
+                  url = target.geturl()
+                  authorization = None
 
-          with (root / "downloads.tsv").open("w", encoding="utf-8", newline="\n") as output:
-              for asset_id, name in downloads:
-                  output.write(f"{asset_id}\t{name}\n")
+              flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+              try:
+                  descriptor = os.open(asset["name"], flags, 0o600, dir_fd=directory_fd)
+              except OSError as error:
+                  response.close()
+                  fail(f"cannot exclusively create downloaded asset {asset['name']}: {error}")
+              digest = hashlib.sha256()
+              total = 0
+              try:
+                  while True:
+                      chunk = response.read(CHUNK)
+                      if not chunk:
+                          break
+                      total += len(chunk)
+                      if total > asset["size"] or total > MAX_ASSET:
+                          fail(f"asset transfer exceeds declared size: {asset['name']}")
+                      digest.update(chunk)
+                      view = memoryview(chunk)
+                      while view:
+                          written = os.write(descriptor, view)
+                          view = view[written:]
+                  metadata = os.fstat(descriptor)
+                  if not stat.S_ISREG(metadata.st_mode) or total != asset["size"] or metadata.st_size != total:
+                      fail(f"asset transfer is truncated or not regular: {asset['name']}")
+              finally:
+                  os.close(descriptor)
+                  response.close()
+              actual_digest = f"sha256:{digest.hexdigest()}"
+              if asset["digest"] is not None and asset["digest"] != actual_digest:
+                  fail(f"asset API digest mismatch: {asset['name']}")
+
+          def main():
+              token = os.environ["GH_TOKEN"]
+              repository = os.environ["REPOSITORY"]
+              tag = os.environ["RELEASE_TAG"]
+              api_url = os.environ["API_URL"].rstrip("/")
+              server_url = os.environ["SERVER_URL"].rstrip("/")
+              if (not token or not tag or repository != os.environ["EVENT_REPOSITORY"]
+                      or urlparse(api_url).scheme != "https"):
+                  fail("release repository, API, or tag does not match the workflow event")
+
+              release_endpoint = f"{api_url}/repos/{repository}/releases/tags/{quote(tag, safe='')}"
+              release, release_bytes = api_json(release_endpoint, token, "release metadata")
+              if not isinstance(release, dict):
+                  fail("release metadata must be a JSON object")
+              release_id = release.get("id")
+              expected_release_url = f"{api_url}/repos/{repository}/releases/{release_id}"
+              if (isinstance(release_id, bool) or not isinstance(release_id, int) or release_id <= 0
+                      or release.get("tag_name") != tag or release.get("url") != expected_release_url
+                      or release.get("assets_url") != f"{expected_release_url}/assets"
+                      or release.get("html_url") != f"{server_url}/{repository}/releases/tag/{tag}"
+                      or release.get("draft") is not False):
+                  fail("published release identity does not match the workflow event")
+
+              tag_endpoint = f"{api_url}/repos/{repository}/git/ref/tags/{quote(tag, safe='')}"
+              tag_ref, tag_bytes = api_json(tag_endpoint, token, "release tag")
+              reference = tag_ref.get("object") if isinstance(tag_ref, dict) else None
+              if (not isinstance(tag_ref, dict) or tag_ref.get("ref") != f"refs/tags/{tag}"
+                      or not isinstance(reference, dict) or reference.get("type") != "commit"
+                      or reference.get("sha") != os.environ["EVENT_SHA"]):
+                  fail("release tag does not resolve to the workflow event commit")
+
+              assets = enumerate_assets(api_url, repository, release_id, token)
+              runner_temp = os.environ["RUNNER_TEMP"]
+              root = Path(tempfile.mkdtemp(prefix="go-release-attest.", dir=runner_temp))
+              os.chmod(root, 0o700)
+              asset_dir = root / "assets"
+              asset_dir.mkdir(mode=0o700)
+              (root / "release.json").write_bytes(release_bytes)
+              (root / "tag.json").write_bytes(tag_bytes)
+              (root / "inventory.json").write_text(json.dumps({"assets": assets}), encoding="utf-8")
+
+              directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+              directory_fd = os.open(asset_dir, directory_flags)
+              try:
+                  for asset in assets:
+                      download_asset(api_url, repository, asset, token, directory_fd)
+              finally:
+                  os.close(directory_fd)
+
+              with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+                  output.write(f"asset-dir={asset_dir}\n")
+
+          if __name__ == "__main__":
+              main()
           PY
-
-          while IFS=$'\t' read -r asset_id asset_name; do
-            gh api -H 'Accept: application/octet-stream' \
-              "/repos/${REPOSITORY}/releases/assets/${asset_id}" > "$ASSET_DIR/$asset_name"
-          done < "$ROOT/downloads.tsv"
-
-          echo "asset-dir=$ASSET_DIR" >> "$GITHUB_OUTPUT"
 
       - name: Validate published release assets
         id: validate
@@ -409,7 +569,10 @@ jobs:
           cloexec = getattr(os, "O_CLOEXEC", 0)
           directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | nofollow | cloexec
           file_flags = os.O_RDONLY | nofollow | cloexec
-          control_limit = 4 * 1024 * 1024
+          control_limit = 1024 * 1024
+          max_assets = 32
+          max_asset = 256 * 1024 * 1024
+          max_total = 1024 * 1024 * 1024
 
           def identity(metadata):
               return (
@@ -471,9 +634,9 @@ jobs:
           def reject_constant(value):
               raise ValueError(f"non-finite JSON number: {value}")
 
-          metadata_path = root / "release.json"
+          metadata_path = root / "inventory.json"
           if metadata_path.stat().st_size > control_limit:
-              raise SystemExit("::error::release metadata is too large")
+              raise SystemExit("::error::release inventory metadata is too large")
           try:
               release = json.loads(
                   metadata_path.read_text(encoding="utf-8"),
@@ -493,18 +656,28 @@ jobs:
           for asset in assets:
               if not isinstance(asset, dict):
                   raise SystemExit("::error::release asset metadata is malformed")
-              name, size = asset.get("name"), asset.get("size")
+              name, size, api_digest = asset.get("name"), asset.get("size"), asset.get("digest")
+              digest_valid = api_digest is None or (
+                  isinstance(api_digest, str) and re.fullmatch(r"sha256:[0-9a-f]{64}", api_digest)
+              )
               if (not isinstance(name, str) or not pattern.fullmatch(name)
                       or name in (".", "..") or name.endswith((".", " "))
                       or name.split(".", 1)[0].upper() in devices
-                      or isinstance(size, bool) or not isinstance(size, int) or size < 0):
-                  raise SystemExit("::error::release asset metadata is malformed or non-portable")
+                      or isinstance(size, bool) or not isinstance(size, int) or size <= 0 or size > max_asset
+                      or not digest_valid):
+                  raise SystemExit("::error::release asset metadata is malformed, oversized, or non-portable")
               if name in expected or name.casefold() in folded:
                   raise SystemExit("::error::release asset metadata duplicates or collides")
-              expected[name] = size
+              expected[name] = {"size": size, "digest": api_digest}
               folded.add(name.casefold())
+          if len(expected) > max_assets:
+              raise SystemExit("::error::release inventory exceeds 32 assets")
           if list(expected).count("checksums.txt") != 1 or len(expected) < 2:
               raise SystemExit("::error::release inventory must contain checksums.txt and other assets")
+          if expected["checksums.txt"]["size"] > control_limit:
+              raise SystemExit("::error::checksums.txt exceeds 1 MiB")
+          if sum(item["size"] for item in expected.values()) > max_total:
+              raise SystemExit("::error::release inventory exceeds 1 GiB")
 
           directory_fd, directory_before = open_directory(asset_dir)
           try:
@@ -517,7 +690,7 @@ jobs:
                   checksum_bytes = read_fd(checksum_fd, checksum_before, "checksums.txt", control_limit)
               finally:
                   os.close(checksum_fd)
-              if checksum_before.st_size != expected["checksums.txt"]:
+              if checksum_before.st_size != expected["checksums.txt"]["size"]:
                   raise SystemExit("::error::downloaded checksums.txt size differs from release metadata")
               try:
                   checksum_text = checksum_bytes.decode("utf-8")
@@ -553,10 +726,13 @@ jobs:
                       unchanged(descriptor, before, name)
                   finally:
                       os.close(descriptor)
-                  if before.st_size != expected[name]:
+                  if before.st_size != expected[name]["size"]:
                       raise SystemExit(f"::error::downloaded size differs from release metadata: {name}")
-                  if digest.hexdigest() != declared[name]:
+                  actual_digest = digest.hexdigest()
+                  if actual_digest != declared[name]:
                       raise SystemExit(f"::error::checksum mismatch for {name}")
+                  if expected[name]["digest"] is not None and expected[name]["digest"] != f"sha256:{actual_digest}":
+                      raise SystemExit(f"::error::GitHub API digest mismatch for {name}")
                   print(f"{name}: OK")
 
               if identity(directory_before) != identity(os.fstat(directory_fd)):
@@ -565,6 +741,9 @@ jobs:
               os.close(directory_fd)
 
           subject_digest = hashlib.sha256(checksum_bytes).hexdigest()
+          manifest_api_digest = expected["checksums.txt"]["digest"]
+          if manifest_api_digest is not None and manifest_api_digest != f"sha256:{subject_digest}":
+              raise SystemExit("::error::GitHub API digest mismatch for checksums.txt")
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
               output.write(f"checksums-digest={subject_digest}\n")
           PY

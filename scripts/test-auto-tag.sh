@@ -75,6 +75,10 @@ for step_name, filename in (
             break
         body.append(line[10:] if line else "")
     (root / filename).write_text("\n".join(body) + "\n")
+    if step_name == "Download published release assets":
+        start = body.index("python3 - <<'PY'") + 1
+        end = body.index("PY", start)
+        (root / "download-release-assets.py").write_text("\n".join(body[start:end]) + "\n")
 PY
 }
 
@@ -386,7 +390,7 @@ PY
   condition=$(printf '%s\n' "$metadata" | sed -n '1p')
   env_value=$(printf '%s\n' "$metadata" | sed -n '2p')
   record "empty binary-name preserves static skip" "if: inputs.binary-name != ''" "$condition"
-  record "binary-name is passed through env" 'BINARY_NAME: ${{ inputs.binary-name }}' "$env_value"
+  record "binary-name is passed through env" "BINARY_NAME: \${{ inputs.binary-name }}" "$env_value"
 }
 
 write_release_metadata() {
@@ -407,7 +411,7 @@ PY
 run_published_asset_case() {
   local name=$1 fixture=$2 expected=$3
   local repo="$TEST_ROOT/published-${name//[^a-zA-Z0-9]/-}"
-  local asset_dir="$repo/assets" metadata="$repo/release.json" output="$repo/github-output"
+  local asset_dir="$repo/assets" metadata="$repo/inventory.json" output="$repo/github-output"
   local status=0 actual=success first_line mutator=""
   mkdir -p "$asset_dir"
   chmod 700 "$asset_dir"
@@ -443,6 +447,28 @@ import sys
 path = Path(sys.argv[1])
 path.write_text(path.read_text().replace('"size": ', '"size": NaN, "original_size": ', 1))
 PY
+      ;;
+    oversized-json)
+      python3 - "$metadata" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+path.write_bytes(b" " * (1024 * 1024 + 1))
+PY
+      ;;
+    oversized-manifest)
+      truncate -s 1048577 "$asset_dir/checksums.txt"
+      write_release_metadata "$asset_dir" "$metadata"
+      ;;
+    oversized-asset)
+      truncate -s 268435457 "$asset_dir/first.tar.gz"
+      write_release_metadata "$asset_dir" "$metadata"
+      ;;
+    oversized-aggregate)
+      for number in 1 2 3 4 5; do
+        truncate -s 268435456 "$asset_dir/aggregate-$number.tgz"
+      done
+      write_release_metadata "$asset_dir" "$metadata"
       ;;
     malformed-asset)
       python3 - "$metadata" <<'PY'
@@ -499,6 +525,29 @@ data["assets"].append({"id": 99, "name": "../alias.tar.gz", "size": 1})
 path.write_text(json.dumps(data))
 PY
       ;;
+    zero-size)
+      python3 - "$metadata" <<'PY'
+import json
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+data = json.loads(path.read_text())
+data["assets"][0]["size"] = 0
+path.write_text(json.dumps(data))
+PY
+      ;;
+    api-digest-mismatch)
+      python3 - "$metadata" <<'PY'
+import json
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+data = json.loads(path.read_text())
+for asset in data["assets"]:
+    if asset["name"] == "first.tar.gz": asset["digest"] = "sha256:" + "0" * 64
+path.write_text(json.dumps(data))
+PY
+      ;;
     symlink-asset)
       cp "$asset_dir/first.tar.gz" "$repo/outside.tar.gz"
       rm "$asset_dir/first.tar.gz"
@@ -544,69 +593,129 @@ PY
   fi
 }
 
-make_download_fixture() {
-  local repo=$1
-  local remote="$repo/remote"
-  mkdir -p "$remote/assets" "$repo/fake-bin" "$repo/runner"
-  printf '%s\n' 'first published asset' > "$remote/assets/first.tar.gz"
-  printf '%s\n' 'second published asset' > "$remote/assets/second.zip"
-  (cd "$remote/assets" && sha256sum first.tar.gz second.zip > checksums.txt)
-  python3 - "$remote" <<'PY'
-import json
+run_download_helper_tests() {
+  local output status=0
+  output=$(python3 - "$TEST_ROOT/download-release-assets.py" <<'PY'
+import hashlib
+import importlib.util
+import io
+import os
 from pathlib import Path
+import tempfile
 import sys
-root = Path(sys.argv[1])
-repository, api, server, tag = "owner/repo", "https://api.github.test", "https://github.test", "v1.2.3"
-assets = []
-for asset_id, name in enumerate(("checksums.txt", "first.tar.gz", "second.zip"), 101):
-    assets.append({"id": asset_id, "name": name, "size": (root / "assets" / name).stat().st_size,
-                   "url": f"{api}/repos/{repository}/releases/assets/{asset_id}"})
-release_id = 77
-(root / "release.json").write_text(json.dumps({
-    "id": release_id, "tag_name": tag,
-    "url": f"{api}/repos/{repository}/releases/{release_id}",
-    "assets_url": f"{api}/repos/{repository}/releases/{release_id}/assets",
-    "html_url": f"{server}/{repository}/releases/tag/{tag}", "draft": False, "assets": assets,
-}))
-(root / "tag.json").write_text(json.dumps({"ref": f"refs/tags/{tag}", "object": {"type": "commit", "sha": "a" * 40}}))
-PY
-  cat > "$repo/fake-bin/gh" <<'SH'
-#!/usr/bin/env bash
-set -euo pipefail
-endpoint=${!#}
-case "$endpoint" in
-  */releases/tags/v1.2.3) cat "$GH_FIXTURE/release.json" ;;
-  */git/ref/tags/v1.2.3) cat "$GH_FIXTURE/tag.json" ;;
-  */releases/assets/101) cat "$GH_FIXTURE/assets/checksums.txt" ;;
-  */releases/assets/102) cat "$GH_FIXTURE/assets/first.tar.gz" ;;
-  */releases/assets/103) cat "$GH_FIXTURE/assets/second.zip" ;;
-  *) printf 'unexpected gh endpoint: %s\n' "$endpoint" >&2; exit 2 ;;
-esac
-SH
-  chmod +x "$repo/fake-bin/gh"
-}
+from urllib.parse import parse_qs, urlparse
 
-run_download_case() {
-  local name=$1 event_sha=$2 expected=$3
-  local repo="$TEST_ROOT/download-${name//[^a-zA-Z0-9]/-}" output status=0 actual=success
-  output="$repo/github-output"
-  make_download_fixture "$repo"
-  PATH="$repo/fake-bin:$PATH" GH_FIXTURE="$repo/remote" RUNNER_TEMP="$repo/runner" \
-    REPOSITORY=owner/repo EVENT_REPOSITORY=owner/repo EVENT_SHA="$event_sha" RELEASE_TAG=v1.2.3 \
-    API_URL=https://api.github.test SERVER_URL=https://github.test GITHUB_OUTPUT="$output" \
-    bash "$TEST_ROOT/download-release-assets.sh" >"$repo/download.log" 2>&1 || status=$?
-  (( status == 0 )) || actual=failure
-  record "$name" "$expected" "$actual"
-  if [[ "$expected" == success ]]; then
-    local asset_dir inventory
-    asset_dir=$(sed -n 's/^asset-dir=//p' "$output")
-    inventory=$(find "$asset_dir" -maxdepth 1 -type f -exec basename {} \; | sort | paste -sd, -)
-    record "$name downloads exact API inventory" "checksums.txt,first.tar.gz,second.zip" "$inventory"
-    local validation_status=success
-    ASSET_DIR="$asset_dir" GITHUB_OUTPUT="$repo/validation-output" \
-      bash "$TEST_ROOT/validate-release-assets.sh" >"$repo/download-validation.log" 2>&1 || validation_status=failure
-    record "$name validates downloaded API bytes" "success" "$validation_status"
+spec = importlib.util.spec_from_file_location("download_release_assets", sys.argv[1])
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+
+class Response:
+    def __init__(self, status, body=b"", headers=None):
+        self.status = status
+        self.stream = io.BytesIO(body)
+        self.headers = headers or {}
+    def read(self, size=-1): return self.stream.read(size)
+    def close(self): pass
+
+class Opener:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.requests = []
+    def open(self, request, timeout=0):
+        self.requests.append(request)
+        if not self.responses: raise AssertionError("unexpected HTTP request")
+        return self.responses.pop(0)
+
+def rejected(call, text):
+    try: call()
+    except SystemExit as error:
+        assert text in str(error), (text, str(error))
+    else: raise AssertionError(f"expected rejection containing {text}")
+
+def asset(number, name, size=1, digest=None):
+    return {"id": number, "name": name, "size": size, "digest": digest}
+
+def enumerate_with(pages, maximum=None):
+    calls = []
+    original = module.api_json
+    old_max = module.MAX_ASSETS
+    if maximum is not None: module.MAX_ASSETS = maximum
+    def fake(url, token, label):
+        calls.append(url)
+        page = int(parse_qs(urlparse(url).query)["page"][0])
+        return pages[page - 1], b"[]"
+    module.api_json = fake
+    try: return module.enumerate_assets("https://api.github.test", "owner/repo", 7, "token"), calls
+    finally:
+        module.api_json = original
+        module.MAX_ASSETS = old_max
+
+page1 = [asset(1, "checksums.txt")] + [asset(i, f"asset-{i}.tar.gz") for i in range(2, 51)]
+page2 = [asset(51, "asset-51.tar.gz"), asset(52, "asset-52.tar.gz")]
+assets, calls = enumerate_with([page1, page2], maximum=64)
+assert len(assets) == 52 and len(calls) == 2
+assert "per_page=50" in calls[0] and "page=1" in calls[0] and "page=2" in calls[1]
+print("pagination spans pages and stops on short page")
+
+rejected(lambda: enumerate_with([[asset(1, "checksums.txt")] + [asset(i, f"a-{i}.tgz") for i in range(2, 34)]]), "more than 32")
+print("asset count over 32 is rejected immediately")
+
+rejected(lambda: enumerate_with([page1, [asset(1, "duplicate-id.tgz")]], maximum=64), "duplicated")
+print("duplicate IDs across pages are rejected")
+
+module.OPENER = Opener([Response(200, b"x" * (module.MAX_JSON + 1))])
+rejected(lambda: module.api_json("https://api.github.test/release", "token", "release metadata"), "byte limit")
+print("oversized API JSON is rejected")
+
+rejected(lambda: enumerate_with([[asset(1, "checksums.txt", module.MAX_MANIFEST + 1), asset(2, "a.tgz")]]), "checksums.txt exceeds")
+rejected(lambda: enumerate_with([[asset(1, "checksums.txt"), asset(2, "a.tgz", module.MAX_ASSET + 1)]]), "256 MiB")
+rejected(lambda: enumerate_with([[asset(1, "checksums.txt"), *[asset(i, f"a-{i}.tgz", module.MAX_ASSET) for i in range(2, 7)]]]), "aggregate")
+print("manifest asset and aggregate bounds are enforced")
+
+def transfer(name, body, expected, responses=None, digest=None):
+    with tempfile.TemporaryDirectory() as temporary:
+        directory_fd = os.open(temporary, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            module.OPENER = Opener(responses or [Response(200, body)])
+            module.download_asset("https://api.github.test", "owner/repo", asset(9, name, expected, digest), "secret", directory_fd)
+            data = (Path(temporary) / name).read_bytes()
+            return module.OPENER.requests, data
+        finally: os.close(directory_fd)
+
+rejected(lambda: transfer("truncated.tgz", b"1234", 5), "truncated")
+rejected(lambda: transfer("overlong.tgz", b"12345", 4), "exceeds declared")
+print("truncated and overlong transfers are rejected")
+
+responses = [
+    Response(302, headers={"Location": "https://release-assets.githubusercontent.com/signed"}),
+    Response(200, b"data"),
+]
+requests, data = transfer("redirect.tgz", b"data", 4, responses)
+assert data == b"data"
+assert requests[0].get_header("Authorization") == "Bearer secret"
+assert requests[1].get_header("Authorization") is None
+print("allowed redirect strips authorization")
+
+bad = [Response(302, headers={"Location": "https://evil.example/asset"})]
+rejected(lambda: transfer("bad-host.tgz", b"data", 4, bad), "not allowed")
+print("untrusted redirect host is rejected")
+
+wrong = "sha256:" + "0" * 64
+rejected(lambda: transfer("digest.tgz", b"data", 4, digest=wrong), "API digest mismatch")
+correct = "sha256:" + hashlib.sha256(b"data").hexdigest()
+_, data = transfer("digest-ok.tgz", b"data", 4, digest=correct)
+assert data == b"data"
+print("API digest is verified when present")
+PY
+) || status=$?
+  if (( status != 0 )); then
+    record "extracted bounded download helper" "success" "failure"
+    printf '%s\n' "$output" >&2
+    return
   fi
+  while IFS= read -r name; do
+    record "$name" "success" "success"
+  done <<< "$output"
 }
 
 assert_isolated_attestation_job() {
@@ -628,7 +737,10 @@ print(value("needs:")); print(value("runs-on:"))
 print("exact" if permissions == {"contents: read", "id-token: write", "attestations: write"} else ",".join(sorted(permissions)))
 print("absent" if "actions/checkout" not in joined else "present")
 print("absent" if not any(token in joined for token in ("Smoke test binary", "chmod +x", "--version")) else "present")
-print("present" if all(token in joined for token in ("releases/tags/", "git/ref/tags/", "releases/assets/")) else "missing")
+print("present" if all(token in joined for token in (
+    "releases/tags/", "git/ref/tags/", "releases/assets/", "per_page", "O_EXCL",
+    "release-assets.githubusercontent.com", "MAX_ASSETS = 32", "MAX_JSON = 1024 * 1024",
+)) else "missing")
 print("present" if all(token in joined for token in ("dir_fd=directory_fd", "O_NOFOLLOW", "os.fstat")) else "missing")
 print(next((line.strip() for line in attest_block if line.strip().startswith("subject-name:")), "missing"))
 print(next((line.strip() for line in attest_block if line.strip().startswith("subject-digest:")), "missing"))
@@ -650,7 +762,7 @@ PY
 }
 
 assert_readme_signer_ref_consistency() {
-  local metadata examples identity guidance
+  local metadata examples identity guidance signer pagination inventory_warning
   metadata=$(python3 - "$README" <<'PY'
 from pathlib import Path
 import re
@@ -664,15 +776,27 @@ identities = re.findall(
 )
 print("v2" if refs and set(refs) == {"v2"} else ",".join(refs) or "missing")
 print("v2" if identities == ["v2"] else ",".join(identities) or "missing")
-print("present" if "@refs/tags/v1" in text and "exact SHA suffix" in text else "missing")
+print("present" if "@refs/tags/v1" in text and "@<exact-40-character-crossbeam-SHA>" in text else "missing")
+print("present" if "--signer-workflow pablontiv/crossbeam/.github/workflows/go-release.yml" in text else "missing")
+print("present" if all(value in text for value in (
+    "RELEASE_ID=$(gh api", "gh api --paginate", "/releases/$RELEASE_ID/assets?per_page=50",
+    "(.digest //", "verify-release/remote.names", "verify-release/downloaded.names",
+)) else "missing")
+print("present" if "sha256sum --check` alone" in text and "remote release inventory" in text else "missing")
 PY
 )
   examples=$(printf '%s\n' "$metadata" | sed -n '1p')
   identity=$(printf '%s\n' "$metadata" | sed -n '2p')
   guidance=$(printf '%s\n' "$metadata" | sed -n '3p')
+  signer=$(printf '%s\n' "$metadata" | sed -n '4p')
+  pagination=$(printf '%s\n' "$metadata" | sed -n '5p')
+  inventory_warning=$(printf '%s\n' "$metadata" | sed -n '6p')
   record "README release examples use v2" "v2" "$examples"
   record "README verifier identity uses v2" "v2" "$identity"
   record "README explains v1 and SHA signer refs" "present" "$guidance"
+  record "README uses signer-workflow without ref" "present" "$signer"
+  record "README enumerates paginated release assets" "present" "$pagination"
+  record "README does not equate sha256sum with inventory proof" "present" "$inventory_warning"
 }
 
 extract_release_script
@@ -750,8 +874,7 @@ assert_empty_binary_name_preserves_static_skip
 
 echo ""
 echo "=== Isolated published release attestation ==="
-run_download_case "downloads current published release" "$(printf 'a%.0s' {1..40})" success
-run_download_case "rejects release tag event mismatch" "$(printf 'b%.0s' {1..40})" failure
+run_download_helper_tests
 run_published_asset_case "valid published assets pass" valid success
 run_published_asset_case "missing checksum file fails" missing-file failure
 run_published_asset_case "missing asset checksum fails" missing-entry failure
@@ -762,11 +885,17 @@ run_published_asset_case "traversing checksum fails" traversal failure
 run_published_asset_case "absolute checksum fails" absolute failure
 run_published_asset_case "duplicate release JSON keys fail" duplicate-json-key failure
 run_published_asset_case "non-finite release JSON fails" nonfinite-json failure
+run_published_asset_case "oversized release JSON fails" oversized-json failure
+run_published_asset_case "oversized checksum manifest fails" oversized-manifest failure
+run_published_asset_case "oversized individual asset fails" oversized-asset failure
+run_published_asset_case "oversized aggregate fails" oversized-aggregate failure
 run_published_asset_case "malformed release asset record fails" malformed-asset failure
 run_published_asset_case "remote inventory missing checksum fails" remote-missing-checksum failure
 run_published_asset_case "remote-only asset fails" remote-extra failure
 run_published_asset_case "remote casefold collision fails" remote-casefold failure
 run_published_asset_case "remote path alias fails" remote-alias failure
+run_published_asset_case "zero-sized API asset fails" zero-size failure
+run_published_asset_case "API digest mismatch fails" api-digest-mismatch failure
 run_published_asset_case "symlink published asset fails" symlink-asset failure
 run_published_asset_case "symlink checksum manifest fails" symlink-checksum failure
 run_published_asset_case "concurrent published asset mutation fails" concurrent-mutation failure
