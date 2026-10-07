@@ -107,6 +107,40 @@ record() {
   fi
 }
 
+run_with_timeout() {
+  local seconds=$1 log=$2
+  shift 2
+  python3 - "$seconds" "$log" "$@" <<'PY'
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
+
+timeout = float(sys.argv[1])
+log = Path(sys.argv[2])
+with log.open("wb") as output:
+    process = subprocess.Popen(
+        sys.argv[3:],
+        stdout=output,
+        stderr=subprocess.STDOUT,
+        start_new_session=True,
+    )
+    try:
+        status = process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        os.killpg(process.pid, signal.SIGTERM)
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            os.killpg(process.pid, signal.SIGKILL)
+            process.wait()
+        output.write(f"fixture timed out after {timeout:g}s\n".encode())
+        status = 124
+raise SystemExit(status)
+PY
+}
+
 make_commit() {
   local repo=$1 subject=$2 body=${3:-}
   printf '%s\n' "$subject" >> "$repo/history.txt"
@@ -804,6 +838,9 @@ run_readme_verification_case() {
   local name=$1 mode=$2 expected=$3
   local repo="$TEST_ROOT/readme-${name//[^a-zA-Z0-9]/-}"
   local remote="$repo/remote" status=0 actual=success
+  local real_find real_mkdir
+  real_find=$(command -v find)
+  real_mkdir=$(command -v mkdir)
   mkdir -p "$remote/assets" "$repo/fake-bin" "$repo/tmp"
   printf '%s\n' 'first published asset' > "$remote/assets/first.tar.gz"
   printf '%s\n' 'second published asset' > "$remote/assets/second.zip"
@@ -862,11 +899,16 @@ exec "$REAL_MKDIR" "$@"
 SH
   chmod +x "$repo/fake-bin/gh" "$repo/fake-bin/find" "$repo/fake-bin/mkdir"
 
-  PATH="$repo/fake-bin:$PATH" GH_FIXTURE="$remote" FIXTURE_MODE="$mode" \
-    REAL_FIND="$(command -v find)" REAL_MKDIR="$(command -v mkdir)" \
+  run_with_timeout 10 "$repo/run.log" env \
+    PATH="$repo/fake-bin:$PATH" GH_FIXTURE="$remote" FIXTURE_MODE="$mode" \
+    REAL_FIND="$real_find" REAL_MKDIR="$real_mkdir" \
     TMPDIR="$repo/tmp" REPO=owner/repo TAG=v1.2.3 \
-    bash "$TEST_ROOT/readme-verify.sh" >"$repo/run.log" 2>&1 || status=$?
-  (( status == 0 )) || actual=failure
+    bash "$TEST_ROOT/readme-verify.sh" || status=$?
+  if (( status == 124 )); then
+    actual=timeout
+  elif (( status != 0 )); then
+    actual=failure
+  fi
   record "$name" "$expected" "$actual"
   record "$name removes temporary verification state" empty \
     "$([[ -z "$(find "$repo/tmp" -mindepth 1 -print -quit)" ]] && echo empty || echo retained)"
