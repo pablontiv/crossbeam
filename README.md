@@ -169,7 +169,7 @@ gh attestation verify checksums.txt --repo OWNER/CONSUMER --cert-identity 'https
 sha256sum --strict --check checksums.txt
 ```
 
-The certificate identity names Crossbeam's reusable release workflow because it is the signer, while `OWNER/CONSUMER` is the repository that owns the release and attestation. The identity above is valid only when the caller uses `go-release.yml@v2`. A caller pinned to `@v1` must use `@refs/tags/v1` in the certificate identity, and a caller pinned to a full commit SHA must use that exact SHA suffix. The workflow fails closed if the checksum manifest is missing, empty, or does not verify. Because GoReleaser publishes before this post-publication gate, a later checksum or attestation failure fails the workflow but does not withdraw a release that is already published.
+The certificate identity names Crossbeam's reusable release workflow because it is the signer, while `OWNER/CONSUMER` is the repository that owns the release and attestation. The identity above is valid only when the caller uses `go-release.yml@v2`. A caller pinned to `@v1` must use `@refs/tags/v1` in the certificate identity, and a caller pinned to a full commit SHA must use that exact SHA suffix. Version 2 downloads the actual published release assets into a fresh job, validates the exact remote inventory and every checksum without executing release binaries, and only then attests `checksums.txt`. Because this gate runs after GoReleaser publishes, a checksum, download, or attestation failure fails the workflow but does not withdraw a release that is already published.
 
 ### Go PR candidate artifacts
 

@@ -55,24 +55,26 @@ output.write_text("\n".join(body) + "\n")
 PY
 }
 
-extract_checksum_script() {
-  python3 - "$WORKFLOW" "$TEST_ROOT/verify-checksums.sh" <<'PY'
+extract_attest_scripts() {
+  python3 - "$WORKFLOW" "$TEST_ROOT" <<'PY'
 from pathlib import Path
 import sys
 
 workflow = Path(sys.argv[1]).read_text().splitlines()
-output = Path(sys.argv[2])
+root = Path(sys.argv[2])
 
-step = next(i for i, line in enumerate(workflow) if line == "      - name: Verify release checksums")
-run = next(i for i in range(step + 1, len(workflow)) if workflow[i] == "        run: |")
-
-body = []
-for line in workflow[run + 1:]:
-    if line and not line.startswith("          "):
-        break
-    body.append(line[10:] if line else "")
-
-output.write_text("\n".join(body) + "\n")
+for step_name, filename in (
+    ("Download published release assets", "download-release-assets.sh"),
+    ("Validate published release assets", "validate-release-assets.sh"),
+):
+    step = next(i for i, line in enumerate(workflow) if line == f"      - name: {step_name}")
+    run = next(i for i in range(step + 1, len(workflow)) if workflow[i] == "        run: |")
+    body = []
+    for line in workflow[run + 1:]:
+        if line and not line.startswith("          "):
+            break
+        body.append(line[10:] if line else "")
+    (root / filename).write_text("\n".join(body) + "\n")
 PY
 }
 
@@ -387,148 +389,142 @@ PY
   record "binary-name is passed through env" 'BINARY_NAME: ${{ inputs.binary-name }}' "$env_value"
 }
 
-run_checksum_case() {
-  local name=$1 fixture=$2 expected=$3
-  local repo="$TEST_ROOT/checksum-${name//[^a-zA-Z0-9]/-}"
-  local status=0 actual=success first_line output="$repo/github-output" mutator=""
-  mkdir -p "$repo/dist/intermediate"
-
-  printf '%s\n' 'first asset' > "$repo/dist/first.tar.gz"
-  printf '%s\n' 'second asset' > "$repo/dist/second.zip"
-  printf '%s\n' 'intermediate binary' > "$repo/dist/intermediate/tool"
-  cat > "$repo/dist/artifacts.json" <<'JSON'
-[
-  {"type":"Archive","name":"first","path":"dist/first.tar.gz"},
-  {"type":"Archive","name":"second","path":"dist/second.zip"},
-  {"type":"Binary","name":"tool","path":"dist/intermediate/tool"},
-  {"type":"Metadata","name":"metadata","path":"dist/metadata.json"},
-  {"type":"Checksum","name":"checksums","path":"dist/checksums.txt"}
+write_release_metadata() {
+  local asset_dir=$1 metadata=$2
+  python3 - "$asset_dir" "$metadata" <<'PY'
+import json
+from pathlib import Path
+import sys
+asset_dir = Path(sys.argv[1])
+assets = [
+    {"id": index, "name": path.name, "size": path.stat().st_size}
+    for index, path in enumerate(sorted(asset_dir.iterdir()), 1)
 ]
-JSON
-  (cd "$repo/dist" && sha256sum first.tar.gz second.zip > checksums.txt)
+Path(sys.argv[2]).write_text(json.dumps({"assets": assets}))
+PY
+}
+
+run_published_asset_case() {
+  local name=$1 fixture=$2 expected=$3
+  local repo="$TEST_ROOT/published-${name//[^a-zA-Z0-9]/-}"
+  local asset_dir="$repo/assets" metadata="$repo/release.json" output="$repo/github-output"
+  local status=0 actual=success first_line mutator=""
+  mkdir -p "$asset_dir"
+  chmod 700 "$asset_dir"
+
+  printf '%s\n' 'first published asset' > "$asset_dir/first.tar.gz"
+  printf '%s\n' 'second published asset' > "$asset_dir/second.zip"
+  (cd "$asset_dir" && sha256sum first.tar.gz second.zip > checksums.txt)
+  write_release_metadata "$asset_dir" "$metadata"
 
   case "$fixture" in
     valid) ;;
-    missing-file)
-      rm "$repo/dist/checksums.txt"
-      ;;
+    missing-file) rm "$asset_dir/checksums.txt" ;;
     missing-entry)
-      first_line=$(head -n 1 "$repo/dist/checksums.txt")
-      printf '%s\n' "$first_line" > "$repo/dist/checksums.txt"
+      first_line=$(head -n 1 "$asset_dir/checksums.txt")
+      printf '%s\n' "$first_line" > "$asset_dir/checksums.txt"
       ;;
-    tampered)
-      printf '%s\n' 'tampered' >> "$repo/dist/first.tar.gz"
-      ;;
+    tampered) printf '%s\n' 'tampered' >> "$asset_dir/first.tar.gz" ;;
     extra-existing)
-      printf '%s\n' 'not published' > "$repo/dist/extra.tar.gz"
-      (cd "$repo/dist" && sha256sum extra.tar.gz >> checksums.txt)
+      printf '%s\n' 'not in remote inventory' > "$asset_dir/extra.tar.gz"
+      (cd "$asset_dir" && sha256sum extra.tar.gz >> checksums.txt)
       ;;
     duplicate)
-      first_line=$(head -n 1 "$repo/dist/checksums.txt")
-      printf '%s\n' "$first_line" >> "$repo/dist/checksums.txt"
+      first_line=$(head -n 1 "$asset_dir/checksums.txt")
+      printf '%s\n' "$first_line" >> "$asset_dir/checksums.txt"
       ;;
-    traversal)
-      printf '%064d  ../outside.tar.gz\n' 0 >> "$repo/dist/checksums.txt"
-      ;;
-    absolute)
-      printf '%064d  /tmp/absolute.tar.gz\n' 0 >> "$repo/dist/checksums.txt"
-      ;;
-    artifacts-shape)
-      printf '%s\n' '{"artifacts": []}' > "$repo/dist/artifacts.json"
-      ;;
-    duplicate-json-key)
-      python3 - "$repo/dist/artifacts.json" <<'PY'
-from pathlib import Path
-import sys
-path = Path(sys.argv[1])
-text = path.read_text().replace('"type":"Archive"', '"type":"Archive","type":"Archive"', 1)
-path.write_text(text)
-PY
-      ;;
+    traversal) printf '%064d  ../outside.tar.gz\n' 0 >> "$asset_dir/checksums.txt" ;;
+    absolute) printf '%064d  /tmp/absolute.tar.gz\n' 0 >> "$asset_dir/checksums.txt" ;;
+    duplicate-json-key) printf '%s' '{"assets":[],"assets":[]}' > "$metadata" ;;
     nonfinite-json)
-      python3 - "$repo/dist/artifacts.json" <<'PY'
+      python3 - "$metadata" <<'PY'
 from pathlib import Path
 import sys
 path = Path(sys.argv[1])
-text = path.read_text().replace('"name":"first"', '"name":"first","invalid":NaN', 1)
-path.write_text(text)
+path.write_text(path.read_text().replace('"size": ', '"size": NaN, "original_size": ', 1))
 PY
       ;;
-    unknown-record)
-      python3 - "$repo/dist/artifacts.json" <<'PY'
-from pathlib import Path
-import sys
-path = Path(sys.argv[1])
-path.write_text(path.read_text().replace('"type":"Metadata"', '"type":"Unknown"'))
-PY
-      ;;
-    malformed-record)
-      python3 - "$repo/dist/artifacts.json" <<'PY'
-from pathlib import Path
-import sys
-path = Path(sys.argv[1])
-path.write_text(path.read_text().replace('"type":"Metadata"', '"type":7'))
-PY
-      ;;
-    checksum-shape)
-      python3 - "$repo/dist/artifacts.json" <<'PY'
+    malformed-asset)
+      python3 - "$metadata" <<'PY'
 import json
 from pathlib import Path
 import sys
 path = Path(sys.argv[1])
-artifacts = json.loads(path.read_text())
-artifacts[-1]["path"] = "dist/sums.txt"
-path.write_text(json.dumps(artifacts))
+data = json.loads(path.read_text())
+data["assets"][0]["name"] = 7
+path.write_text(json.dumps(data))
 PY
       ;;
-    manifest-traversal)
-      python3 - "$repo/dist/artifacts.json" <<'PY'
+    remote-missing-checksum)
+      python3 - "$metadata" <<'PY'
 import json
 from pathlib import Path
 import sys
 path = Path(sys.argv[1])
-artifacts = json.loads(path.read_text())
-artifacts[0]["path"] = "dist/../first.tar.gz"
-path.write_text(json.dumps(artifacts))
+data = json.loads(path.read_text())
+data["assets"] = [asset for asset in data["assets"] if asset["name"] != "checksums.txt"]
+path.write_text(json.dumps(data))
 PY
       ;;
-    symlink)
-      cp "$repo/dist/first.tar.gz" "$repo/outside.tar.gz"
-      rm "$repo/dist/first.tar.gz"
-      ln -s ../outside.tar.gz "$repo/dist/first.tar.gz"
+    remote-extra)
+      python3 - "$metadata" <<'PY'
+import json
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+data = json.loads(path.read_text())
+data["assets"].append({"id": 99, "name": "remote-only.tar.gz", "size": 1})
+path.write_text(json.dumps(data))
+PY
       ;;
-    symlink-artifacts)
-      cp "$repo/dist/artifacts.json" "$repo/artifacts.json"
-      rm "$repo/dist/artifacts.json"
-      ln -s ../artifacts.json "$repo/dist/artifacts.json"
+    remote-casefold)
+      python3 - "$metadata" <<'PY'
+import json
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+data = json.loads(path.read_text())
+data["assets"].append({"id": 99, "name": "FIRST.TAR.GZ", "size": 1})
+path.write_text(json.dumps(data))
+PY
+      ;;
+    remote-alias)
+      python3 - "$metadata" <<'PY'
+import json
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+data = json.loads(path.read_text())
+data["assets"].append({"id": 99, "name": "../alias.tar.gz", "size": 1})
+path.write_text(json.dumps(data))
+PY
+      ;;
+    symlink-asset)
+      cp "$asset_dir/first.tar.gz" "$repo/outside.tar.gz"
+      rm "$asset_dir/first.tar.gz"
+      ln -s ../outside.tar.gz "$asset_dir/first.tar.gz"
       ;;
     symlink-checksum)
-      cp "$repo/dist/checksums.txt" "$repo/checksums.txt"
-      rm "$repo/dist/checksums.txt"
-      ln -s ../checksums.txt "$repo/dist/checksums.txt"
+      cp "$asset_dir/checksums.txt" "$repo/checksums.txt"
+      rm "$asset_dir/checksums.txt"
+      ln -s ../checksums.txt "$asset_dir/checksums.txt"
       ;;
     concurrent-mutation)
-      truncate -s 268435456 "$repo/dist/first.tar.gz"
-      (cd "$repo/dist" && sha256sum first.tar.gz second.zip > checksums.txt)
+      truncate -s 268435456 "$asset_dir/first.tar.gz"
+      (cd "$asset_dir" && sha256sum first.tar.gz second.zip > checksums.txt)
+      write_release_metadata "$asset_dir" "$metadata"
       ;;
-    *)
-      printf 'unknown checksum fixture: %s\n' "$fixture" >&2
-      exit 1
-      ;;
+    *) printf 'unknown published asset fixture: %s\n' "$fixture" >&2; exit 1 ;;
   esac
 
   if [[ "$fixture" == concurrent-mutation ]]; then
     rm -f "$repo/stop-mutator"
-    (
-      while [[ ! -e "$repo/stop-mutator" ]]; do
-        touch "$repo/dist/first.tar.gz"
-        sleep 0.001
-      done
-    ) &
+    (while [[ ! -e "$repo/stop-mutator" ]]; do touch "$asset_dir/first.tar.gz"; sleep 0.001; done) &
     mutator=$!
   fi
 
-  (cd "$repo" && GITHUB_OUTPUT="$output" bash "$TEST_ROOT/verify-checksums.sh") >"$repo/checksum.log" 2>&1 || status=$?
+  ASSET_DIR="$asset_dir" GITHUB_OUTPUT="$output" \
+    bash "$TEST_ROOT/validate-release-assets.sh" >"$repo/validation.log" 2>&1 || status=$?
   if [[ -n "$mutator" ]]; then
     touch "$repo/stop-mutator"
     wait "$mutator" || true
@@ -537,51 +533,120 @@ PY
   record "$name" "$expected" "$actual"
   if [[ "$fixture" == concurrent-mutation ]]; then
     local mutation_result=missing
-    grep -q "changed while reading" "$repo/checksum.log" && mutation_result=detected
+    grep -q "changed while reading" "$repo/validation.log" && mutation_result=detected
     record "$name is detected by fstat" "detected" "$mutation_result"
   fi
-
   if [[ "$expected" == success ]]; then
-    local expected_subject actual_subject
-    expected_subject="$(sha256sum "$repo/dist/checksums.txt" | cut -d' ' -f1)  checksums.txt"
-    actual_subject=$(sed -n 's/^subject-checksums=//p' "$output")
-    record "$name emits checksum subject" "$expected_subject" "$actual_subject"
+    local expected_digest actual_digest
+    expected_digest=$(sha256sum "$asset_dir/checksums.txt" | cut -d' ' -f1)
+    actual_digest=$(sed -n 's/^checksums-digest=//p' "$output")
+    record "$name emits only validated checksum digest" "$expected_digest" "$actual_digest"
   fi
 }
 
-assert_attestation_is_fail_closed_and_ordered() {
-  local metadata order continue_on_error subject_checksums subject_path gate_id
+make_download_fixture() {
+  local repo=$1
+  local remote="$repo/remote"
+  mkdir -p "$remote/assets" "$repo/fake-bin" "$repo/runner"
+  printf '%s\n' 'first published asset' > "$remote/assets/first.tar.gz"
+  printf '%s\n' 'second published asset' > "$remote/assets/second.zip"
+  (cd "$remote/assets" && sha256sum first.tar.gz second.zip > checksums.txt)
+  python3 - "$remote" <<'PY'
+import json
+from pathlib import Path
+import sys
+root = Path(sys.argv[1])
+repository, api, server, tag = "owner/repo", "https://api.github.test", "https://github.test", "v1.2.3"
+assets = []
+for asset_id, name in enumerate(("checksums.txt", "first.tar.gz", "second.zip"), 101):
+    assets.append({"id": asset_id, "name": name, "size": (root / "assets" / name).stat().st_size,
+                   "url": f"{api}/repos/{repository}/releases/assets/{asset_id}"})
+release_id = 77
+(root / "release.json").write_text(json.dumps({
+    "id": release_id, "tag_name": tag,
+    "url": f"{api}/repos/{repository}/releases/{release_id}",
+    "assets_url": f"{api}/repos/{repository}/releases/{release_id}/assets",
+    "html_url": f"{server}/{repository}/releases/tag/{tag}", "draft": False, "assets": assets,
+}))
+(root / "tag.json").write_text(json.dumps({"ref": f"refs/tags/{tag}", "object": {"type": "commit", "sha": "a" * 40}}))
+PY
+  cat > "$repo/fake-bin/gh" <<'SH'
+#!/usr/bin/env bash
+set -euo pipefail
+endpoint=${!#}
+case "$endpoint" in
+  */releases/tags/v1.2.3) cat "$GH_FIXTURE/release.json" ;;
+  */git/ref/tags/v1.2.3) cat "$GH_FIXTURE/tag.json" ;;
+  */releases/assets/101) cat "$GH_FIXTURE/assets/checksums.txt" ;;
+  */releases/assets/102) cat "$GH_FIXTURE/assets/first.tar.gz" ;;
+  */releases/assets/103) cat "$GH_FIXTURE/assets/second.zip" ;;
+  *) printf 'unexpected gh endpoint: %s\n' "$endpoint" >&2; exit 2 ;;
+esac
+SH
+  chmod +x "$repo/fake-bin/gh"
+}
+
+run_download_case() {
+  local name=$1 event_sha=$2 expected=$3
+  local repo="$TEST_ROOT/download-${name//[^a-zA-Z0-9]/-}" output status=0 actual=success
+  output="$repo/github-output"
+  make_download_fixture "$repo"
+  PATH="$repo/fake-bin:$PATH" GH_FIXTURE="$repo/remote" RUNNER_TEMP="$repo/runner" \
+    REPOSITORY=owner/repo EVENT_REPOSITORY=owner/repo EVENT_SHA="$event_sha" RELEASE_TAG=v1.2.3 \
+    API_URL=https://api.github.test SERVER_URL=https://github.test GITHUB_OUTPUT="$output" \
+    bash "$TEST_ROOT/download-release-assets.sh" >"$repo/download.log" 2>&1 || status=$?
+  (( status == 0 )) || actual=failure
+  record "$name" "$expected" "$actual"
+  if [[ "$expected" == success ]]; then
+    local asset_dir inventory
+    asset_dir=$(sed -n 's/^asset-dir=//p' "$output")
+    inventory=$(find "$asset_dir" -maxdepth 1 -type f -exec basename {} \; | sort | paste -sd, -)
+    record "$name downloads exact API inventory" "checksums.txt,first.tar.gz,second.zip" "$inventory"
+    local validation_status=success
+    ASSET_DIR="$asset_dir" GITHUB_OUTPUT="$repo/validation-output" \
+      bash "$TEST_ROOT/validate-release-assets.sh" >"$repo/download-validation.log" 2>&1 || validation_status=failure
+    record "$name validates downloaded API bytes" "success" "$validation_status"
+  fi
+}
+
+assert_isolated_attestation_job() {
+  local metadata
   metadata=$(python3 - "$WORKFLOW" <<'PY'
 from pathlib import Path
 import sys
-
 lines = Path(sys.argv[1]).read_text().splitlines()
-gate = next(i for i, line in enumerate(lines) if line == "      - name: Verify release checksums")
-attest = next(i for i, line in enumerate(lines) if line == "      - name: Generate SLSA attestation")
-end = next(
-    (i for i in range(attest + 1, len(lines)) if lines[i].startswith("      - name:")),
-    len(lines),
-)
-gate_block = lines[gate:attest]
-attest_block = lines[attest:end]
-print("gate-before-attestation" if gate < attest else "invalid-order")
-print("present" if any(line.strip().startswith("continue-on-error:") for line in attest_block) else "absent")
-print(next((line.strip() for line in attest_block if line.strip().startswith("subject-checksums:")), "missing"))
-print("present" if any(line.strip().startswith("subject-path:") for line in attest_block) else "absent")
-print(next((line.strip() for line in gate_block if line.strip().startswith("id:")), "missing"))
+release = next(i for i, line in enumerate(lines) if line == "  release:")
+attest = next(i for i, line in enumerate(lines) if line == "  attest:")
+release_block, attest_block = lines[release:attest], lines[attest:]
+steps = next(i for i, line in enumerate(attest_block) if line == "    steps:")
+header = attest_block[:steps]
+def value(prefix): return next((line.strip() for line in header if line.strip().startswith(prefix)), "missing")
+permissions = {line.strip() for line in header if line.startswith("      ") and ":" in line}
+joined = "\n".join(attest_block)
+print("clean" if not any("Validate published release assets" in line or "Generate SLSA attestation" in line for line in release_block) else "mixed")
+print(value("needs:")); print(value("runs-on:"))
+print("exact" if permissions == {"contents: read", "id-token: write", "attestations: write"} else ",".join(sorted(permissions)))
+print("absent" if "actions/checkout" not in joined else "present")
+print("absent" if not any(token in joined for token in ("Smoke test binary", "chmod +x", "--version")) else "present")
+print("present" if all(token in joined for token in ("releases/tags/", "git/ref/tags/", "releases/assets/")) else "missing")
+print("present" if all(token in joined for token in ("dir_fd=directory_fd", "O_NOFOLLOW", "os.fstat")) else "missing")
+print(next((line.strip() for line in attest_block if line.strip().startswith("subject-name:")), "missing"))
+print(next((line.strip() for line in attest_block if line.strip().startswith("subject-digest:")), "missing"))
+print("absent" if not any(line.strip().startswith(("subject-path:", "subject-checksums:")) for line in attest_block) else "present")
 PY
 )
-  order=$(printf '%s\n' "$metadata" | sed -n '1p')
-  continue_on_error=$(printf '%s\n' "$metadata" | sed -n '2p')
-  subject_checksums=$(printf '%s\n' "$metadata" | sed -n '3p')
-  subject_path=$(printf '%s\n' "$metadata" | sed -n '4p')
-  gate_id=$(printf '%s\n' "$metadata" | sed -n '5p')
-  record "checksum gate runs before attestation" "gate-before-attestation" "$order"
-  record "attestation has no continue-on-error" "absent" "$continue_on_error"
-  record "checksum gate has output id" "id: verify-checksums" "$gate_id"
-  record "attestation uses validated checksum output" \
-    "subject-checksums: \${{ steps.verify-checksums.outputs.subject-checksums }}" "$subject_checksums"
-  record "attestation does not reopen subject-path" "absent" "$subject_path"
+  record "release job excludes validation and attestation" "clean" "$(printf '%s\n' "$metadata" | sed -n '1p')"
+  record "attest job needs release" "needs: release" "$(printf '%s\n' "$metadata" | sed -n '2p')"
+  record "attest job uses fresh pinned runner" "runs-on: ubuntu-24.04" "$(printf '%s\n' "$metadata" | sed -n '3p')"
+  record "attest job permissions are minimal" "exact" "$(printf '%s\n' "$metadata" | sed -n '4p')"
+  record "attest job has no checkout" "absent" "$(printf '%s\n' "$metadata" | sed -n '5p')"
+  record "attest job does not execute release binaries" "absent" "$(printf '%s\n' "$metadata" | sed -n '6p')"
+  record "attest job downloads release tag ref and assets" "present" "$(printf '%s\n' "$metadata" | sed -n '7p')"
+  record "attest validator uses FD-relative nofollow reads" "present" "$(printf '%s\n' "$metadata" | sed -n '8p')"
+  record "attestation subject name is checksums.txt" "subject-name: checksums.txt" "$(printf '%s\n' "$metadata" | sed -n '9p')"
+  record "attestation uses validated digest output" \
+    "subject-digest: sha256:\${{ steps.validate.outputs.checksums-digest }}" "$(printf '%s\n' "$metadata" | sed -n '10p')"
+  record "attestation has no path or checksums reopening" "absent" "$(printf '%s\n' "$metadata" | sed -n '11p')"
 }
 
 assert_readme_signer_ref_consistency() {
@@ -612,7 +677,7 @@ PY
 
 extract_release_script
 extract_smoke_script
-extract_checksum_script
+extract_attest_scripts
 
 echo "=== Post-1.0 policy ==="
 run_case "breaking defaults to minor" v2.3.4 5 "" v2.4.0 true feat \
@@ -684,27 +749,28 @@ assert_smoke_invalid_manifest_fails
 assert_empty_binary_name_preserves_static_skip
 
 echo ""
-echo "=== Go release checksum and attestation gate ==="
-run_checksum_case "valid archive checksums pass" valid success
-run_checksum_case "missing checksum file fails" missing-file failure
-run_checksum_case "missing archive checksum fails" missing-entry failure
-run_checksum_case "tampered archive fails" tampered failure
-run_checksum_case "extra existing checksum fails" extra-existing failure
-run_checksum_case "duplicate checksum fails" duplicate failure
-run_checksum_case "traversing checksum fails" traversal failure
-run_checksum_case "absolute checksum fails" absolute failure
-run_checksum_case "artifacts root shape mismatch fails" artifacts-shape failure
-run_checksum_case "duplicate JSON keys fail" duplicate-json-key failure
-run_checksum_case "non-finite JSON fails" nonfinite-json failure
-run_checksum_case "unknown artifact record fails" unknown-record failure
-run_checksum_case "malformed artifact record fails" malformed-record failure
-run_checksum_case "checksum artifact shape mismatch fails" checksum-shape failure
-run_checksum_case "manifest traversal fails" manifest-traversal failure
-run_checksum_case "symlink archive fails" symlink failure
-run_checksum_case "symlink artifacts manifest fails" symlink-artifacts failure
-run_checksum_case "symlink checksum manifest fails" symlink-checksum failure
-run_checksum_case "concurrent archive mutation fails" concurrent-mutation failure
-assert_attestation_is_fail_closed_and_ordered
+echo "=== Isolated published release attestation ==="
+run_download_case "downloads current published release" "$(printf 'a%.0s' {1..40})" success
+run_download_case "rejects release tag event mismatch" "$(printf 'b%.0s' {1..40})" failure
+run_published_asset_case "valid published assets pass" valid success
+run_published_asset_case "missing checksum file fails" missing-file failure
+run_published_asset_case "missing asset checksum fails" missing-entry failure
+run_published_asset_case "tampered published asset fails" tampered failure
+run_published_asset_case "extra downloaded asset fails" extra-existing failure
+run_published_asset_case "duplicate checksum fails" duplicate failure
+run_published_asset_case "traversing checksum fails" traversal failure
+run_published_asset_case "absolute checksum fails" absolute failure
+run_published_asset_case "duplicate release JSON keys fail" duplicate-json-key failure
+run_published_asset_case "non-finite release JSON fails" nonfinite-json failure
+run_published_asset_case "malformed release asset record fails" malformed-asset failure
+run_published_asset_case "remote inventory missing checksum fails" remote-missing-checksum failure
+run_published_asset_case "remote-only asset fails" remote-extra failure
+run_published_asset_case "remote casefold collision fails" remote-casefold failure
+run_published_asset_case "remote path alias fails" remote-alias failure
+run_published_asset_case "symlink published asset fails" symlink-asset failure
+run_published_asset_case "symlink checksum manifest fails" symlink-checksum failure
+run_published_asset_case "concurrent published asset mutation fails" concurrent-mutation failure
+assert_isolated_attestation_job
 assert_readme_signer_ref_consistency
 
 echo ""
