@@ -23,6 +23,7 @@ Shared CI/CD infrastructure for the [pablontiv](https://github.com/pablontiv) ec
 - [Core Idea](#core-idea)
 - [What's Inside](#whats-inside)
 - [Usage](#usage)
+- [Verify a Go release](#verify-a-go-release)
 - [AI-Native](#ai-native)
 - [Versioning](#versioning)
 - [Documentation](#documentation)
@@ -36,23 +37,23 @@ Shared CI/CD infrastructure for the [pablontiv](https://github.com/pablontiv) ec
 ```yaml
 # 1. Wire up Go CI — build, test, lint, coverage gate
 ci:
-  uses: pablontiv/crossbeam/.github/workflows/go-ci.yml@v1
+  uses: pablontiv/crossbeam/.github/workflows/go-ci.yml@v2
   with:
     coverage-threshold: 85
 
 # 2. Add secret scanning (runs on every push)
 gitleaks:
-  uses: pablontiv/crossbeam/.github/workflows/gitleaks.yml@v1
+  uses: pablontiv/crossbeam/.github/workflows/gitleaks.yml@v2
 
 # 3. Add security analysis (nightly CodeQL)
 codeql:
-  uses: pablontiv/crossbeam/.github/workflows/codeql.yml@v1
+  uses: pablontiv/crossbeam/.github/workflows/codeql.yml@v2
   with:
     language: go
 
 # 4. Add automated releases — auto-tag + goreleaser on push to main
 release:
-  uses: pablontiv/crossbeam/.github/workflows/go-release.yml@v1
+  uses: pablontiv/crossbeam/.github/workflows/go-release.yml@v2
   needs: [ci, gitleaks]
   with:
     quality-gate-jobs: '["ci","gitleaks"]'
@@ -76,7 +77,7 @@ To use the previous "full" behavior by default, pass `with: profile: full`:
 
 ```yaml
 ci:
-  uses: pablontiv/crossbeam/.github/workflows/go-ci.yml@v1
+  uses: pablontiv/crossbeam/.github/workflows/go-ci.yml@v2
   with:
     profile: full
     coverage-threshold: 85
@@ -138,15 +139,15 @@ on:
 
 jobs:
   ci:
-    uses: pablontiv/crossbeam/.github/workflows/go-ci.yml@v1
+    uses: pablontiv/crossbeam/.github/workflows/go-ci.yml@v2
     with:
       coverage-threshold: 85
 
   gitleaks:
-    uses: pablontiv/crossbeam/.github/workflows/gitleaks.yml@v1
+    uses: pablontiv/crossbeam/.github/workflows/gitleaks.yml@v2
 
   release:
-    uses: pablontiv/crossbeam/.github/workflows/go-release.yml@v1
+    uses: pablontiv/crossbeam/.github/workflows/go-release.yml@v2
     needs: [ci, gitleaks]
     with:
       quality-gate-jobs: '["ci","gitleaks"]'
@@ -156,6 +157,88 @@ jobs:
       id-token: write
       attestations: write
 ```
+
+### Verify a Go release
+
+Resolve the published release ID, enumerate its complete paginated asset inventory, download every asset by API ID, and retain the remote names, sizes, and API digests:
+
+```bash
+set -euo pipefail
+: "${REPO:=OWNER/CONSUMER}"
+: "${TAG:=vX.Y.Z}"
+VERIFY_ROOT=$(mktemp -d "${TMPDIR:-/tmp}/crossbeam-verify.XXXXXX")
+cleanup() { rm -rf -- "$VERIFY_ROOT"; }
+trap cleanup EXIT
+mkdir -m 700 "$VERIFY_ROOT/assets"
+
+RELEASE_ID=$(gh api "repos/$REPO/releases/tags/$TAG" --jq .id)
+[[ "$RELEASE_ID" =~ ^[1-9][0-9]*$ ]]
+gh api --paginate "repos/$REPO/releases/$RELEASE_ID/assets?per_page=50" \
+  --jq '.[] | [.id, .name, .size, (.digest // "")] | @tsv' > "$VERIFY_ROOT/assets.tsv"
+python3 - "$VERIFY_ROOT/assets.tsv" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+rows = [line.split("\t") for line in Path(sys.argv[1]).read_text().splitlines()]
+if not 2 <= len(rows) <= 32:
+    raise SystemExit("release must contain 2..32 assets")
+names, ids, total = [], set(), 0
+devices = {"CON", "PRN", "AUX", "NUL", *(f"COM{n}" for n in range(1, 10)), *(f"LPT{n}" for n in range(1, 10))}
+for row in rows:
+    if len(row) != 4:
+        raise SystemExit("invalid asset row")
+    asset_id, name, raw_size, digest = row
+    if not asset_id.isdigit() or int(asset_id) <= 0 or asset_id in ids:
+        raise SystemExit("invalid or duplicate asset ID")
+    if (not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]*", name) or name.endswith(".")
+            or name.split(".", 1)[0].upper() in devices):
+        raise SystemExit("non-portable asset name")
+    try:
+        size = int(raw_size)
+    except ValueError as error:
+        raise SystemExit("invalid asset size") from error
+    if not 0 < size <= 256 * 1024 * 1024:
+        raise SystemExit("asset size out of bounds")
+    if digest and not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
+        raise SystemExit("invalid API digest")
+    ids.add(asset_id)
+    names.append(name)
+    total += size
+if names.count("checksums.txt") != 1 or len(names) != len(set(names)) or len(names) != len({name.casefold() for name in names}):
+    raise SystemExit("invalid release inventory")
+if next(int(row[2]) for row in rows if row[1] == "checksums.txt") > 1024 * 1024:
+    raise SystemExit("checksums.txt is too large")
+if total > 1024 * 1024 * 1024:
+    raise SystemExit("release inventory is too large")
+PY
+
+while IFS=$'\t' read -r id name size digest; do
+  gh api -H 'Accept: application/octet-stream' "repos/$REPO/releases/assets/$id" \
+    > "$VERIFY_ROOT/assets/$name"
+  test "$(wc -c < "$VERIFY_ROOT/assets/$name" | tr -d ' ')" = "$size"
+  actual="sha256:$(sha256sum "$VERIFY_ROOT/assets/$name" | cut -d' ' -f1)"
+  test -z "$digest" || test "$actual" = "$digest"
+done < "$VERIFY_ROOT/assets.tsv"
+
+cut -f2 "$VERIFY_ROOT/assets.tsv" | sort > "$VERIFY_ROOT/remote.names"
+find "$VERIFY_ROOT/assets" -maxdepth 1 -type f -exec basename {} \; | sort > "$VERIFY_ROOT/downloaded.names"
+diff -u "$VERIFY_ROOT/remote.names" "$VERIFY_ROOT/downloaded.names"
+grep -v '^checksums\.txt$' "$VERIFY_ROOT/remote.names" > "$VERIFY_ROOT/payload.names"
+sed -nE 's/^[0-9a-f]{64}  ([A-Za-z0-9][A-Za-z0-9._-]*)$/\1/p' \
+  "$VERIFY_ROOT/assets/checksums.txt" | sort > "$VERIFY_ROOT/manifest.names"
+diff -u "$VERIFY_ROOT/payload.names" "$VERIFY_ROOT/manifest.names"
+
+cd "$VERIFY_ROOT/assets"
+gh attestation verify checksums.txt --repo "$REPO" \
+  --signer-workflow pablontiv/crossbeam/.github/workflows/go-release.yml \
+  --cert-identity 'https://github.com/pablontiv/crossbeam/.github/workflows/go-release.yml@refs/tags/v2'
+sha256sum --strict --check checksums.txt
+```
+
+The inventory and API-digest comparisons are essential: `sha256sum --check` alone verifies only names present in `checksums.txt` and does not prove that the manifest covers the complete remote release inventory. `OWNER/CONSUMER` is the consumer repository that owns the release and attestation. `--signer-workflow` selects Crossbeam's reusable workflow path without a ref; `--cert-identity` separately pins the certificate SAN to the exact reusable-workflow ref. The SAN suffix is `@refs/tags/v2` for a `@v2` caller, `@refs/tags/v1` for a `@v1` caller, or `@<exact-40-character-crossbeam-SHA>` for a SHA-pinned caller. That Crossbeam signer/source SHA is distinct from both the consumer release commit and the attested SHA-256 digest of `checksums.txt`.
+
+Version 2 downloads bounded, paginated published assets into a fresh job, validates the exact remote inventory and every checksum without executing release binaries, and only then attests `checksums.txt`. Because this gate runs after GoReleaser publishes, an inventory, checksum, download, or attestation failure fails the workflow but does not withdraw a release that is already published.
 
 ### Go PR candidate artifacts
 
@@ -275,7 +358,7 @@ Crossbeam is the **security and release infrastructure** for a suite of AI-nativ
 
 ## Versioning
 
-This repository follows semver. Consumers reference `@v1` (major tag alias) to automatically receive patches and new features without changing their caller stubs.
+This repository follows semver. Consumers reference `@v2` (major tag alias) to automatically receive patches and new features without changing their caller stubs.
 
 | Change | Bump |
 |--------|------|
@@ -316,7 +399,7 @@ on:
 
 jobs:
   release:
-    uses: pablontiv/crossbeam/.github/workflows/go-release.yml@v1
+    uses: pablontiv/crossbeam/.github/workflows/go-release.yml@v2
     with:
       quality-gate-jobs: '["test", "lint"]'
       force-bump: ${{ inputs.force-bump || '' }}
