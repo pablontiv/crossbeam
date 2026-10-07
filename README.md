@@ -37,23 +37,23 @@ Shared CI/CD infrastructure for the [pablontiv](https://github.com/pablontiv) ec
 ```yaml
 # 1. Wire up Go CI — build, test, lint, coverage gate
 ci:
-  uses: pablontiv/crossbeam/.github/workflows/go-ci.yml@v1
+  uses: pablontiv/crossbeam/.github/workflows/go-ci.yml@v2
   with:
     coverage-threshold: 85
 
 # 2. Add secret scanning (runs on every push)
 gitleaks:
-  uses: pablontiv/crossbeam/.github/workflows/gitleaks.yml@v1
+  uses: pablontiv/crossbeam/.github/workflows/gitleaks.yml@v2
 
 # 3. Add security analysis (nightly CodeQL)
 codeql:
-  uses: pablontiv/crossbeam/.github/workflows/codeql.yml@v1
+  uses: pablontiv/crossbeam/.github/workflows/codeql.yml@v2
   with:
     language: go
 
 # 4. Add automated releases — auto-tag + goreleaser on push to main
 release:
-  uses: pablontiv/crossbeam/.github/workflows/go-release.yml@v1
+  uses: pablontiv/crossbeam/.github/workflows/go-release.yml@v2
   needs: [ci, gitleaks]
   with:
     quality-gate-jobs: '["ci","gitleaks"]'
@@ -77,7 +77,7 @@ To use the previous "full" behavior by default, pass `with: profile: full`:
 
 ```yaml
 ci:
-  uses: pablontiv/crossbeam/.github/workflows/go-ci.yml@v1
+  uses: pablontiv/crossbeam/.github/workflows/go-ci.yml@v2
   with:
     profile: full
     coverage-threshold: 85
@@ -139,15 +139,15 @@ on:
 
 jobs:
   ci:
-    uses: pablontiv/crossbeam/.github/workflows/go-ci.yml@v1
+    uses: pablontiv/crossbeam/.github/workflows/go-ci.yml@v2
     with:
       coverage-threshold: 85
 
   gitleaks:
-    uses: pablontiv/crossbeam/.github/workflows/gitleaks.yml@v1
+    uses: pablontiv/crossbeam/.github/workflows/gitleaks.yml@v2
 
   release:
-    uses: pablontiv/crossbeam/.github/workflows/go-release.yml@v1
+    uses: pablontiv/crossbeam/.github/workflows/go-release.yml@v2
     needs: [ci, gitleaks]
     with:
       quality-gate-jobs: '["ci","gitleaks"]'
@@ -169,7 +169,7 @@ gh attestation verify checksums.txt --repo OWNER/CONSUMER --cert-identity 'https
 sha256sum --strict --check checksums.txt
 ```
 
-The certificate identity names Crossbeam's reusable release workflow because it is the signer, while `OWNER/CONSUMER` is the repository that owns the release and attestation. The workflow fails closed if the checksum manifest is missing, empty, or does not verify. Because GoReleaser publishes before this post-publication gate, a later checksum or attestation failure fails the workflow but does not withdraw a release that is already published.
+The certificate identity names Crossbeam's reusable release workflow because it is the signer, while `OWNER/CONSUMER` is the repository that owns the release and attestation. The identity above is valid only when the caller uses `go-release.yml@v2`. A caller pinned to `@v1` must use `@refs/tags/v1` in the certificate identity, and a caller pinned to a full commit SHA must use that exact SHA suffix. The workflow fails closed if the checksum manifest is missing, empty, or does not verify. Because GoReleaser publishes before this post-publication gate, a later checksum or attestation failure fails the workflow but does not withdraw a release that is already published.
 
 ### Go PR candidate artifacts
 
@@ -289,7 +289,7 @@ Crossbeam is the **security and release infrastructure** for a suite of AI-nativ
 
 ## Versioning
 
-This repository follows semver. Consumers reference `@v1` (major tag alias) to automatically receive patches and new features without changing their caller stubs.
+This repository follows semver. Consumers reference `@v2` (major tag alias) to automatically receive patches and new features without changing their caller stubs.
 
 | Change | Bump |
 |--------|------|
@@ -330,7 +330,7 @@ on:
 
 jobs:
   release:
-    uses: pablontiv/crossbeam/.github/workflows/go-release.yml@v1
+    uses: pablontiv/crossbeam/.github/workflows/go-release.yml@v2
     with:
       quality-gate-jobs: '["test", "lint"]'
       force-bump: ${{ inputs.force-bump || '' }}

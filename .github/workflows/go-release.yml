@@ -263,10 +263,12 @@ jobs:
           "$ARTIFACT" version
 
       - name: Verify release checksums
+        id: verify-checksums
         run: |
           python3 - <<'PY'
           import hashlib
           import json
+          import os
           from pathlib import Path
           import re
           import stat
@@ -283,24 +285,57 @@ jobs:
               *(f"LPT{number}" for number in range(1, 10)),
           }
 
-          def regular(path):
+          open_flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+
+          def stat_identity(metadata):
+              return (
+                  metadata.st_dev, metadata.st_ino, metadata.st_mode, metadata.st_size,
+                  metadata.st_mtime_ns, metadata.st_ctime_ns,
+              )
+
+          def open_regular(path):
               try:
-                  metadata = path.lstat()
+                  descriptor = os.open(path, open_flags)
               except OSError as error:
-                  raise SystemExit(f"::error::missing release file {path}: {error}") from error
-              if path.is_symlink() or not stat.S_ISREG(metadata.st_mode):
-                  raise SystemExit(f"::error::release file is not regular: {path}")
-              return path
+                  raise SystemExit(f"::error::cannot safely open release file {path}: {error}") from error
+              try:
+                  metadata = os.fstat(descriptor)
+                  if not stat.S_ISREG(metadata.st_mode):
+                      raise SystemExit(f"::error::release file is not regular: {path}")
+                  return descriptor, metadata
+              except BaseException:
+                  os.close(descriptor)
+                  raise
+
+          def unchanged(descriptor, before, path):
+              after = os.fstat(descriptor)
+              if stat_identity(before) != stat_identity(after):
+                  raise SystemExit(f"::error::release file changed while reading: {path}")
 
           def read_control(path):
-              path = regular(path)
+              descriptor, before = open_regular(path)
               try:
-                  with path.open("rb") as stream:
-                      data = stream.read(control_limit + 1)
+                  if before.st_size > control_limit:
+                      raise SystemExit(f"::error::release control file is too large: {path}")
+                  chunks = []
+                  remaining = control_limit + 1
+                  while remaining:
+                      chunk = os.read(descriptor, min(64 * 1024, remaining))
+                      if not chunk:
+                          break
+                      chunks.append(chunk)
+                      remaining -= len(chunk)
+                  data = b"".join(chunks)
+                  unchanged(descriptor, before, path)
               except OSError as error:
                   raise SystemExit(f"::error::cannot read release file {path}: {error}") from error
+              finally:
+                  os.close(descriptor)
               if len(data) > control_limit:
                   raise SystemExit(f"::error::release control file is too large: {path}")
+              return data
+
+          def decode_control(data, path):
               try:
                   return data.decode("utf-8")
               except UnicodeDecodeError as error:
@@ -313,15 +348,48 @@ jobs:
                   raise SystemExit(f"::error::non-portable release basename: {value!r}")
               return value
 
+          def unique_object(pairs):
+              value = {}
+              for key, item in pairs:
+                  if key in value:
+                      raise ValueError(f"duplicate JSON key: {key}")
+                  value[key] = item
+              return value
+
+          def reject_constant(value):
+              raise ValueError(f"non-finite JSON number: {value}")
+
+          artifacts_path = dist / "artifacts.json"
+          artifacts_bytes = read_control(artifacts_path)
           try:
-              artifacts = json.loads(read_control(dist / "artifacts.json"))
-          except json.JSONDecodeError as error:
+              artifacts = json.loads(
+                  decode_control(artifacts_bytes, artifacts_path),
+                  object_pairs_hook=unique_object,
+                  parse_constant=reject_constant,
+              )
+          except (json.JSONDecodeError, ValueError) as error:
               raise SystemExit(f"::error::invalid artifacts.json: {error}") from error
           if not isinstance(artifacts, list) or not all(isinstance(item, dict) for item in artifacts):
               raise SystemExit("::error::artifacts.json must use GoReleaser's direct-list shape")
 
-          archives = [item for item in artifacts if item.get("type") == "Archive"]
-          checksum_items = [item for item in artifacts if item.get("type") == "Checksum"]
+          known_types = {
+              "Archive", "Binary", "C Archive Library", "C Header", "C Shared Library",
+              "Certificate", "Checksum", "Chocolatey", "Docker Image", "Docker Manifest",
+              "File", "Flatpak", "Homebrew Cask", "Homebrew Formula", "Krew Plugin Manifest",
+              "Linux Package", "Makeself Package", "Metadata", "MSIX", "Nixpkg", "PKGBUILD",
+              "Published Docker Image", "SBOM", "Signature", "Snap", "Scoop Manifest", "Source",
+              "Source Dist", "Source RPM", "SRCINFO", "Wheel", "Winget Manifest",
+          }
+          for item in artifacts:
+              artifact_type = item.get("type")
+              if not isinstance(artifact_type, str) or artifact_type not in known_types:
+                  raise SystemExit("::error::artifact record has an unknown or malformed type")
+              if (not isinstance(item.get("name"), str) or not item["name"]
+                      or not isinstance(item.get("path"), str) or not item["path"]):
+                  raise SystemExit("::error::artifact record has a malformed name or path")
+
+          archives = [item for item in artifacts if item["type"] == "Archive"]
+          checksum_items = [item for item in artifacts if item["type"] == "Checksum"]
           if not archives or len(checksum_items) != 1 or checksum_items[0].get("path") != "dist/checksums.txt":
               raise SystemExit("::error::expected archives and exactly one dist/checksums.txt artifact")
 
@@ -333,15 +401,15 @@ jobs:
               name = portable_basename(raw_path.removeprefix("dist/"))
               if raw_path != f"dist/{name}":
                   raise SystemExit("::error::archive path must be literal dist/basename")
-              regular(dist / name)
               expected_names.append(name)
 
           expected_casefold = [name.casefold() for name in expected_names]
           if len(set(expected_names)) != len(expected_names) or len(set(expected_casefold)) != len(expected_casefold):
               raise SystemExit("::error::duplicate or case-colliding archive paths in artifacts.json")
 
-          checksum_path = regular(dist / "checksums.txt")
-          checksum_text = read_control(checksum_path)
+          checksum_path = dist / "checksums.txt"
+          checksum_bytes = read_control(checksum_path)
+          checksum_text = decode_control(checksum_bytes, checksum_path)
           if not checksum_text.endswith("\n") or "\r" in checksum_text:
               raise SystemExit("::error::checksums.txt must contain LF-terminated lines")
           checksum_lines = checksum_text[:-1].split("\n")
@@ -363,19 +431,27 @@ jobs:
               raise SystemExit("::error::checksum names do not exactly match published archives")
 
           for name in expected_names:
+              path = dist / name
+              descriptor, before = open_regular(path)
               digest = hashlib.sha256()
               try:
-                  with regular(dist / name).open("rb") as stream:
-                      while chunk := stream.read(1024 * 1024):
-                          digest.update(chunk)
+                  while chunk := os.read(descriptor, 1024 * 1024):
+                      digest.update(chunk)
+                  unchanged(descriptor, before, path)
               except OSError as error:
                   raise SystemExit(f"::error::cannot hash release asset {name}: {error}") from error
+              finally:
+                  os.close(descriptor)
               if digest.hexdigest() != declared[name]:
                   raise SystemExit(f"::error::checksum mismatch for {name}")
               print(f"{name}: OK")
+
+          subject_digest = hashlib.sha256(checksum_bytes).hexdigest()
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"subject-checksums={subject_digest}  checksums.txt\n")
           PY
 
       - name: Generate SLSA attestation
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8
         with:
-          subject-path: 'dist/checksums.txt'
+          subject-checksums: ${{ steps.verify-checksums.outputs.subject-checksums }}

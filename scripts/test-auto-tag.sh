@@ -4,6 +4,7 @@ set -euo pipefail
 
 ROOT=$(git rev-parse --show-toplevel)
 WORKFLOW="$ROOT/.github/workflows/go-release.yml"
+README="$ROOT/README.md"
 TEST_ROOT=$(mktemp -d)
 PASS=0
 FAIL=0
@@ -389,7 +390,7 @@ PY
 run_checksum_case() {
   local name=$1 fixture=$2 expected=$3
   local repo="$TEST_ROOT/checksum-${name//[^a-zA-Z0-9]/-}"
-  local status=0 actual=success first_line
+  local status=0 actual=success first_line output="$repo/github-output" mutator=""
   mkdir -p "$repo/dist/intermediate"
 
   printf '%s\n' 'first asset' > "$repo/dist/first.tar.gz"
@@ -435,6 +436,40 @@ JSON
     artifacts-shape)
       printf '%s\n' '{"artifacts": []}' > "$repo/dist/artifacts.json"
       ;;
+    duplicate-json-key)
+      python3 - "$repo/dist/artifacts.json" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+text = path.read_text().replace('"type":"Archive"', '"type":"Archive","type":"Archive"', 1)
+path.write_text(text)
+PY
+      ;;
+    nonfinite-json)
+      python3 - "$repo/dist/artifacts.json" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+text = path.read_text().replace('"name":"first"', '"name":"first","invalid":NaN', 1)
+path.write_text(text)
+PY
+      ;;
+    unknown-record)
+      python3 - "$repo/dist/artifacts.json" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+path.write_text(path.read_text().replace('"type":"Metadata"', '"type":"Unknown"'))
+PY
+      ;;
+    malformed-record)
+      python3 - "$repo/dist/artifacts.json" <<'PY'
+from pathlib import Path
+import sys
+path = Path(sys.argv[1])
+path.write_text(path.read_text().replace('"type":"Metadata"', '"type":7'))
+PY
+      ;;
     checksum-shape)
       python3 - "$repo/dist/artifacts.json" <<'PY'
 import json
@@ -462,19 +497,60 @@ PY
       rm "$repo/dist/first.tar.gz"
       ln -s ../outside.tar.gz "$repo/dist/first.tar.gz"
       ;;
+    symlink-artifacts)
+      cp "$repo/dist/artifacts.json" "$repo/artifacts.json"
+      rm "$repo/dist/artifacts.json"
+      ln -s ../artifacts.json "$repo/dist/artifacts.json"
+      ;;
+    symlink-checksum)
+      cp "$repo/dist/checksums.txt" "$repo/checksums.txt"
+      rm "$repo/dist/checksums.txt"
+      ln -s ../checksums.txt "$repo/dist/checksums.txt"
+      ;;
+    concurrent-mutation)
+      truncate -s 268435456 "$repo/dist/first.tar.gz"
+      (cd "$repo/dist" && sha256sum first.tar.gz second.zip > checksums.txt)
+      ;;
     *)
       printf 'unknown checksum fixture: %s\n' "$fixture" >&2
       exit 1
       ;;
   esac
 
-  (cd "$repo" && bash "$TEST_ROOT/verify-checksums.sh") >"$repo/checksum.log" 2>&1 || status=$?
+  if [[ "$fixture" == concurrent-mutation ]]; then
+    rm -f "$repo/stop-mutator"
+    (
+      while [[ ! -e "$repo/stop-mutator" ]]; do
+        touch "$repo/dist/first.tar.gz"
+        sleep 0.001
+      done
+    ) &
+    mutator=$!
+  fi
+
+  (cd "$repo" && GITHUB_OUTPUT="$output" bash "$TEST_ROOT/verify-checksums.sh") >"$repo/checksum.log" 2>&1 || status=$?
+  if [[ -n "$mutator" ]]; then
+    touch "$repo/stop-mutator"
+    wait "$mutator" || true
+  fi
   (( status == 0 )) || actual=failure
   record "$name" "$expected" "$actual"
+  if [[ "$fixture" == concurrent-mutation ]]; then
+    local mutation_result=missing
+    grep -q "changed while reading" "$repo/checksum.log" && mutation_result=detected
+    record "$name is detected by fstat" "detected" "$mutation_result"
+  fi
+
+  if [[ "$expected" == success ]]; then
+    local expected_subject actual_subject
+    expected_subject="$(sha256sum "$repo/dist/checksums.txt" | cut -d' ' -f1)  checksums.txt"
+    actual_subject=$(sed -n 's/^subject-checksums=//p' "$output")
+    record "$name emits checksum subject" "$expected_subject" "$actual_subject"
+  fi
 }
 
 assert_attestation_is_fail_closed_and_ordered() {
-  local metadata order continue_on_error subject
+  local metadata order continue_on_error subject_checksums subject_path gate_id
   metadata=$(python3 - "$WORKFLOW" <<'PY'
 from pathlib import Path
 import sys
@@ -486,18 +562,52 @@ end = next(
     (i for i in range(attest + 1, len(lines)) if lines[i].startswith("      - name:")),
     len(lines),
 )
-block = lines[attest:end]
+gate_block = lines[gate:attest]
+attest_block = lines[attest:end]
 print("gate-before-attestation" if gate < attest else "invalid-order")
-print("present" if any(line.strip().startswith("continue-on-error:") for line in block) else "absent")
-print(next((line.strip() for line in block if line.strip().startswith("subject-path:")), "missing"))
+print("present" if any(line.strip().startswith("continue-on-error:") for line in attest_block) else "absent")
+print(next((line.strip() for line in attest_block if line.strip().startswith("subject-checksums:")), "missing"))
+print("present" if any(line.strip().startswith("subject-path:") for line in attest_block) else "absent")
+print(next((line.strip() for line in gate_block if line.strip().startswith("id:")), "missing"))
 PY
 )
   order=$(printf '%s\n' "$metadata" | sed -n '1p')
   continue_on_error=$(printf '%s\n' "$metadata" | sed -n '2p')
-  subject=$(printf '%s\n' "$metadata" | sed -n '3p')
+  subject_checksums=$(printf '%s\n' "$metadata" | sed -n '3p')
+  subject_path=$(printf '%s\n' "$metadata" | sed -n '4p')
+  gate_id=$(printf '%s\n' "$metadata" | sed -n '5p')
   record "checksum gate runs before attestation" "gate-before-attestation" "$order"
   record "attestation has no continue-on-error" "absent" "$continue_on_error"
-  record "attestation subject remains checksums.txt" "subject-path: 'dist/checksums.txt'" "$subject"
+  record "checksum gate has output id" "id: verify-checksums" "$gate_id"
+  record "attestation uses validated checksum output" \
+    "subject-checksums: \${{ steps.verify-checksums.outputs.subject-checksums }}" "$subject_checksums"
+  record "attestation does not reopen subject-path" "absent" "$subject_path"
+}
+
+assert_readme_signer_ref_consistency() {
+  local metadata examples identity guidance
+  metadata=$(python3 - "$README" <<'PY'
+from pathlib import Path
+import re
+import sys
+
+text = Path(sys.argv[1]).read_text()
+refs = re.findall(r"pablontiv/crossbeam/\.github/workflows/go-release\.yml@(v[0-9]+)", text)
+identities = re.findall(
+    r"https://github\.com/pablontiv/crossbeam/\.github/workflows/go-release\.yml@refs/tags/(v[0-9]+)",
+    text,
+)
+print("v2" if refs and set(refs) == {"v2"} else ",".join(refs) or "missing")
+print("v2" if identities == ["v2"] else ",".join(identities) or "missing")
+print("present" if "@refs/tags/v1" in text and "exact SHA suffix" in text else "missing")
+PY
+)
+  examples=$(printf '%s\n' "$metadata" | sed -n '1p')
+  identity=$(printf '%s\n' "$metadata" | sed -n '2p')
+  guidance=$(printf '%s\n' "$metadata" | sed -n '3p')
+  record "README release examples use v2" "v2" "$examples"
+  record "README verifier identity uses v2" "v2" "$identity"
+  record "README explains v1 and SHA signer refs" "present" "$guidance"
 }
 
 extract_release_script
@@ -584,10 +694,18 @@ run_checksum_case "duplicate checksum fails" duplicate failure
 run_checksum_case "traversing checksum fails" traversal failure
 run_checksum_case "absolute checksum fails" absolute failure
 run_checksum_case "artifacts root shape mismatch fails" artifacts-shape failure
+run_checksum_case "duplicate JSON keys fail" duplicate-json-key failure
+run_checksum_case "non-finite JSON fails" nonfinite-json failure
+run_checksum_case "unknown artifact record fails" unknown-record failure
+run_checksum_case "malformed artifact record fails" malformed-record failure
 run_checksum_case "checksum artifact shape mismatch fails" checksum-shape failure
 run_checksum_case "manifest traversal fails" manifest-traversal failure
 run_checksum_case "symlink archive fails" symlink failure
+run_checksum_case "symlink artifacts manifest fails" symlink-artifacts failure
+run_checksum_case "symlink checksum manifest fails" symlink-checksum failure
+run_checksum_case "concurrent archive mutation fails" concurrent-mutation failure
 assert_attestation_is_fail_closed_and_ordered
+assert_readme_signer_ref_consistency
 
 echo ""
 printf 'Results: %d passed, %d failed\n' "$PASS" "$FAIL"
