@@ -405,6 +405,44 @@ jobs:
       force-bump: ${{ inputs.force-bump || '' }}
 ```
 
+### Batch releases instead of one per push
+
+By default every release-worthy push to the default branch becomes a release. On a repository where agents merge many small PRs in a day that means many tags, a noisy changelog, and auto-updaters pulling a new binary every half hour. `go-release.yml` accepts `release-on` to change the cadence:
+
+| `release-on` | Behaviour |
+|--------------|-----------|
+| `push` (default) | Tag on every release-worthy push |
+| `explicit` | Tag only on `workflow_dispatch` or `schedule` events; pushes accumulate |
+
+The bump is always computed from every commit since the last tag, so a batched release gets the highest bump any of its commits earned (breaking or `feat` → minor, `fix`/`perf` → patch, maintenance-only → no release). `force-bump` still applies.
+
+A weekly batch with a manual escape hatch looks like this in the caller:
+
+```yaml
+on:
+  push:
+    branches: [main]
+  schedule:
+    - cron: '17 14 * * 2'   # Tuesdays 14:17 UTC — the weekly batch
+  workflow_dispatch:
+    inputs:
+      force-bump:
+        description: 'Override with major, minor, or patch; leave empty for automatic'
+        required: false
+        type: string
+        default: ''
+
+jobs:
+  release:
+    uses: pablontiv/crossbeam/.github/workflows/go-release.yml@v2
+    with:
+      quality-gate-jobs: '["test", "lint"]'
+      release-on: explicit
+      force-bump: ${{ inputs.force-bump || '' }}
+```
+
+Pushes still run the quality gates; only the tag step waits. `release-on` is not yet implemented in `rust-release.yml`.
+
 ---
 
 ## Documentation
@@ -413,7 +451,7 @@ jobs:
 |-------|-------------|
 | [go-ci.yml](.github/workflows/go-ci.yml) | Go CI: profile (light/full), coverage threshold, lint gate |
 | [rust-ci.yml](.github/workflows/rust-ci.yml) | Rust CI: profile (light/full), toolchain, deny checks |
-| [go-release.yml](.github/workflows/go-release.yml) | Auto-tag + goreleaser: quality gates, graduation threshold |
+| [go-release.yml](.github/workflows/go-release.yml) | Auto-tag + goreleaser: quality gates, graduation threshold, release cadence |
 | [go-candidate.yml](.github/workflows/go-candidate.yml) | Opt-in Go PR candidate snapshots and interface |
 | [codeql.yml](.github/workflows/codeql.yml) | CodeQL: language input, nightly schedule |
 | [scorecard.yml](.github/workflows/scorecard.yml) | OpenSSF Scorecard: SARIF upload |

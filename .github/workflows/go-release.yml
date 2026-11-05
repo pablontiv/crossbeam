@@ -33,6 +33,15 @@ on:
         type: string
         default: ''
         description: 'Override the computed bump: major, minor, patch, or empty for automatic'
+      release-on:
+        required: false
+        type: string
+        default: 'push'
+        description: >-
+          When a release may be cut. 'push' (default) tags every release-worthy
+          push to the default branch. 'explicit' tags only on workflow_dispatch
+          or schedule events, so pushes accumulate into one batched release;
+          the bump is still computed from every commit since the last tag.
     secrets:
       GPG_PRIVATE_KEY:
         required: false
@@ -64,6 +73,8 @@ jobs:
         env:
           GRADUATION_THRESHOLD: ${{ inputs.graduation-threshold }}
           FORCE_BUMP: ${{ inputs.force-bump }}
+          RELEASE_ON: ${{ inputs.release-on }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
           case "$FORCE_BUMP" in
             ""|major|minor|patch) ;;
@@ -72,6 +83,27 @@ jobs:
               exit 1
               ;;
           esac
+
+          # Release cadence. 'push' keeps the historical one-release-per-push
+          # behaviour. 'explicit' lets pushes accumulate and only tags when a
+          # maintainer (workflow_dispatch) or a schedule asks for a release; the
+          # classification below still spans every commit since the last tag, so
+          # a batched release gets the highest bump any of its commits earned.
+          RELEASE_ON=${RELEASE_ON:-push}
+          EVENT_NAME=${EVENT_NAME:-push}
+          case "$RELEASE_ON" in
+            push|explicit) ;;
+            *)
+              echo "::error::Invalid release-on '$RELEASE_ON': expected push or explicit"
+              exit 1
+              ;;
+          esac
+          if [[ "$RELEASE_ON" == "explicit" && "$EVENT_NAME" != "workflow_dispatch" && "$EVENT_NAME" != "schedule" ]]; then
+            echo "release-on=explicit: '$EVENT_NAME' is not a release trigger; commits accumulate until the next workflow_dispatch or schedule run"
+            echo "new_tag=" >> "$GITHUB_OUTPUT"
+            echo "created=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
 
           # Find latest semver tag
           LATEST=$(git tag -l 'v*' | sort -V | tail -1)
