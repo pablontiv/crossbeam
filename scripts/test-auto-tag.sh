@@ -241,6 +241,33 @@ assert_invalid_force_bump_fails() {
   fi
 }
 
+assert_invalid_release_on_fails() {
+  local repo="$TEST_ROOT/invalid-release-on"
+  local remote="$TEST_ROOT/invalid-release-on.git"
+  git init --bare "$remote" >/dev/null
+  git init -b main "$repo" >/dev/null
+  git -C "$repo" config user.name Test
+  git -C "$repo" config user.email test@example.com
+  git -C "$repo" remote add origin "$remote"
+  make_commit "$repo" "chore: initialize fixture"
+  git -C "$repo" tag v1.2.3
+  git -C "$repo" push origin main v1.2.3 >/dev/null
+  make_commit "$repo" "fix: repair bug"
+
+  local status=0
+  (
+    cd "$repo"
+    GRADUATION_THRESHOLD=5 FORCE_BUMP="" RELEASE_ON=weekly EVENT_NAME=push GITHUB_OUTPUT="$repo/github-output" \
+      "$TEST_ROOT/compute-tag.sh"
+  ) >"$repo/run.log" 2>&1 || status=$?
+
+  if (( status != 0 )) && grep -q "Invalid release-on" "$repo/run.log"; then
+    record "invalid release-on fails loudly" "rejected" "rejected"
+  else
+    record "invalid release-on fails loudly" "rejected" "accepted"
+  fi
+}
+
 assert_release_job_skips_without_created_tag() {
   local condition
   condition=$(python3 - "$WORKFLOW" <<'PY'
@@ -1014,8 +1041,28 @@ run_case "first maintenance commit creates no tag" none 5 "" "" false other \
   "docs: explain command" ""
 
 echo ""
+echo "=== Release cadence (release-on) ==="
+RELEASE_ON=explicit EVENT_NAME=push run_case "explicit cadence skips a push" v2.3.4 5 "" "" false "" \
+  "fix: repair bug" ""
+RELEASE_ON=explicit EVENT_NAME=pull_request run_case "explicit cadence skips other events" v2.3.4 5 "" "" false "" \
+  "feat: add thing" ""
+RELEASE_ON=explicit EVENT_NAME=workflow_dispatch run_case "explicit cadence tags on dispatch" v2.3.4 5 "" v2.3.5 true fix \
+  "fix: repair bug" ""
+RELEASE_ON=explicit EVENT_NAME=schedule run_case "explicit cadence batches accumulated pushes" v2.3.4 5 "" v2.4.0 true feat \
+  "fix: first push" "" "docs: second push" "" "feat: third push" ""
+RELEASE_ON=explicit EVENT_NAME=schedule run_case "explicit cadence still skips maintenance-only ranges" v2.3.4 5 "" "" false other \
+  "docs: only docs" "" "chore: only chores" ""
+RELEASE_ON=explicit EVENT_NAME=workflow_dispatch run_case "explicit cadence honors force-bump" v2.3.4 5 major v3.0.0 true fix \
+  "fix: repair bug" ""
+RELEASE_ON=push EVENT_NAME=push run_case "push cadence keeps tagging on push" v2.3.4 5 "" v2.3.5 true fix \
+  "fix: repair bug" ""
+RELEASE_ON=push EVENT_NAME=schedule run_case "push cadence also tags on schedule" v2.3.4 5 "" v2.3.5 true fix \
+  "fix: repair bug" ""
+
+echo ""
 echo "=== Validation and downstream gating ==="
 assert_invalid_force_bump_fails
+assert_invalid_release_on_fails
 assert_release_job_skips_without_created_tag
 
 echo ""
