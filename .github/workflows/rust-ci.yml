@@ -46,7 +46,7 @@ jobs:
           components: rustfmt, clippy
 
       - name: Cache Rust
-        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           shared-key: "ci"
 
@@ -84,7 +84,7 @@ jobs:
           toolchain: ${{ inputs.rust-toolchain }}
 
       - name: Cache Rust
-        uses: swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6  # v2.9.2
+        uses: swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0  # v2.9.3
         with:
           shared-key: "ci"
 
